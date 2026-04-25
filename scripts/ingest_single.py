@@ -14,6 +14,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Allow running from the repo root
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -93,29 +94,10 @@ def run_pipeline(url: Optional[str], file_path: Optional[str], law_id: str, out_
     # 7. Save Bundle
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    all_edges = contains_edges + ref_edges
-    
-    files = {
-        "legal_units.json": units,
-        "legal_edges.json": all_edges,
-        "reference_candidates.json": resolved_candidates,
-        "validation_report.json": report,
-    }
+    with open(out_dir / "legal_units.json", "w", encoding="utf-8") as f:
+        json.dump(units, f, indent=2, ensure_ascii=False)
 
-    for filename, data in files.items():
-        with open(out_dir / filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-    # 8. Build Manifest
-    sources_mock = [{
-        "law_id": law_id,
-        "law_title": law_title,
-        "url": url or file_path
-    }]
-    manifest = build_manifest(out_dir.name, sources_mock, out_dir)
-    save_manifest(manifest, out_dir / "corpus_manifest.json")
-
-    print(f"\n=== Success! Output written to {out_dir} ===")
+    print(f"\n=== Success! Output written to {out_dir}/legal_units.json ===")
 
 
 def main():
