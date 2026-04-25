@@ -91,6 +91,26 @@ class EmbeddingOutputValidationSummary(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class EmbeddingInputOutputValidationSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_read_count: int = 0
+    output_read_count: int = 0
+    embeddable_input_count: int = 0
+    matched_output_count: int = 0
+    missing_output_count: int = 0
+    orphan_output_count: int = 0
+    identity_mismatch_count: int = 0
+    duplicate_input_record_id_count: int = 0
+    duplicate_output_resume_key_count: int = 0
+    unexpected_output_for_empty_input_count: int = 0
+    model_names: list[str] = Field(default_factory=list)
+    embedding_dims: list[int] = Field(default_factory=list)
+    law_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
 class EmbeddingProvider(Protocol):
     def embed_texts(self, texts: list[str], model_name: str) -> list[list[float]]:
         ...
@@ -420,6 +440,127 @@ def validate_embeddings_output(
             "embedding output validation failed: "
             f"invalid_count={invalid_count}, error_count={len(errors)}; "
             f"{preview}{suffix}"
+        )
+    return summary
+
+
+def validate_embeddings_pair(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    expected_model: str | None = None,
+    expected_dim: int | None = None,
+    require_all_inputs: bool = True,
+    strict: bool = True,
+) -> EmbeddingInputOutputValidationSummary:
+    if expected_model is not None and not expected_model.strip():
+        raise ValueError("expected_model must be non-empty when provided")
+    if expected_dim is not None and expected_dim <= 0:
+        raise ValueError("expected_dim must be greater than 0")
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    output_summary = validate_embeddings_output(
+        output_path,
+        expected_model=expected_model,
+        expected_dim=expected_dim,
+        require_unique_resume_keys=True,
+        strict=False,
+    )
+    errors.extend(f"output: {message}" for message in output_summary.errors)
+    warnings.extend(f"output: {message}" for message in output_summary.warnings)
+
+    input_records = load_embedding_input_jsonl(input_path)
+    input_by_record_id: dict[str, EmbeddingInputRecord] = {}
+    embeddable_record_ids: set[str] = set()
+    non_embeddable_record_ids: set[str] = set()
+    duplicate_input_record_id_count = 0
+    for record in input_records:
+        if record.record_id in input_by_record_id:
+            duplicate_input_record_id_count += 1
+            errors.append(f"input record_id={record.record_id}: duplicate input record_id")
+            continue
+        input_by_record_id[record.record_id] = record
+        if record.embedding_text.strip():
+            embeddable_record_ids.add(record.record_id)
+        else:
+            non_embeddable_record_ids.add(record.record_id)
+
+    matched_output_count = 0
+    orphan_output_count = 0
+    identity_mismatch_count = 0
+    unexpected_output_for_empty_input_count = 0
+    matched_by_record_id: dict[str, set[str]] = {}
+    output_records: list[EmbeddingOutputRecord] = []
+    if not output_summary.errors:
+        output_records = load_embedding_output_jsonl(output_path)
+
+    for output in output_records:
+        input_record = input_by_record_id.get(output.record_id)
+        output_label = (
+            f"output record_id={output.record_id} "
+            f"model_name={output.model_name} text_hash={output.text_hash}"
+        )
+        if input_record is None:
+            orphan_output_count += 1
+            errors.append(f"{output_label}: orphan output record_id")
+            continue
+        if output.record_id in non_embeddable_record_ids:
+            unexpected_output_for_empty_input_count += 1
+            errors.append(f"{output_label}: unexpected output for non-embeddable input")
+            continue
+
+        mismatched_fields = [
+            field
+            for field in ("chunk_id", "legal_unit_id", "law_id", "text_hash")
+            if getattr(output, field) != getattr(input_record, field)
+        ]
+        if mismatched_fields:
+            identity_mismatch_count += 1
+            errors.append(
+                f"{output_label}: identity mismatch fields={','.join(mismatched_fields)}"
+            )
+            continue
+
+        matched_output_count += 1
+        matched_by_record_id.setdefault(output.record_id, set()).add(output.model_name)
+
+    missing_output_count = 0
+    for record_id in sorted(embeddable_record_ids):
+        matched_models = matched_by_record_id.get(record_id, set())
+        is_missing = expected_model not in matched_models if expected_model else not matched_models
+        if is_missing:
+            missing_output_count += 1
+            message = f"input record_id={record_id}: missing embedding output"
+            if require_all_inputs:
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+    summary = EmbeddingInputOutputValidationSummary(
+        input_read_count=len(input_records),
+        output_read_count=output_summary.read_count,
+        embeddable_input_count=len(embeddable_record_ids),
+        matched_output_count=matched_output_count,
+        missing_output_count=missing_output_count,
+        orphan_output_count=orphan_output_count,
+        identity_mismatch_count=identity_mismatch_count,
+        duplicate_input_record_id_count=duplicate_input_record_id_count,
+        duplicate_output_resume_key_count=output_summary.duplicate_resume_key_count,
+        unexpected_output_for_empty_input_count=unexpected_output_for_empty_input_count,
+        model_names=output_summary.model_names,
+        embedding_dims=output_summary.embedding_dims,
+        law_ids=output_summary.law_ids,
+        warnings=warnings,
+        errors=errors,
+    )
+    if strict and summary.errors:
+        preview = "; ".join(summary.errors[:5])
+        remaining = len(summary.errors) - min(len(summary.errors), 5)
+        suffix = f"; ... {remaining} more" if remaining else ""
+        raise ValueError(
+            "embedding pair validation failed: "
+            f"error_count={len(summary.errors)}; {preview}{suffix}"
         )
     return summary
 
