@@ -1,0 +1,11 @@
+{
+  "duplicate_ids": [],
+  "status": "PASS",
+  "total_units": 0,
+  "total_contains_edges": 0,
+  "total_ref_candidates": 0,
+  "resolved_candidates": 0,
+  "ReferenceResolutionRate": 0.0,
+  "orphan_units": [],
+  "warnings": []
+}
