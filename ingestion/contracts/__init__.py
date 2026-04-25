@@ -41,6 +41,9 @@ ReferenceResolutionStatus = Literal[
     "resolved_medium_confidence",
     "candidate_ambiguous",
     "external_unresolved",
+    "unresolved_ambiguous",
+    "unresolved_needs_context",
+    "candidate_only",
     "unresolved",
 ]
 
@@ -123,9 +126,12 @@ class ParsedLegalUnit(IngestionContract):
     incoming_reference_ids: list[str] = Field(default_factory=list)
     parser_warnings: list[str] = Field(default_factory=list)
 
-    def to_legal_unit_dict(self) -> dict[str, Any]:
-        """Return the API LegalUnit-compatible shape used by retrieval/evidence."""
-        return self.model_dump(include=LEGAL_UNIT_FIELDS)
+    def to_legal_unit_dict(self, *, include_parser_warnings: bool = False) -> dict[str, Any]:
+        """Return the LegalUnit shape used by retrieval/evidence."""
+        fields = set(LEGAL_UNIT_FIELDS)
+        if include_parser_warnings:
+            fields.add("parser_warnings")
+        return self.model_dump(include=fields)
 
 
 class ParsedLegalEdge(IngestionContract):
@@ -206,8 +212,9 @@ class ReferenceCandidate(IngestionContract):
     target_paragraph: str | None = None
     target_letter: str | None = None
     target_point: str | None = None
+    target_thesis: str | None = None
     resolved_target_id: str | None = None
-    resolution_status: ReferenceResolutionStatus = "unresolved"
+    resolution_status: ReferenceResolutionStatus = "candidate_only"
     resolution_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     resolver_notes: list[str] = Field(default_factory=list)
 
@@ -225,13 +232,18 @@ class ValidationReport(IngestionContract):
     schema_version: str = "1.0"
     parser_version: str
     corpus_quality: float = Field(ge=0.0, le=1.0)
+    import_blocking_passed: bool = True
+    demo_path_passed: bool | None = None
     units_count: int = Field(ge=0)
     edges_count: int = Field(ge=0)
     chunks_count: int = Field(default=0, ge=0)
     reference_candidates_count: int = Field(default=0, ge=0)
     quality_metrics: dict[str, float]
+    blocking_errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    validation_config: dict[str, Any] = Field(default_factory=dict)
+    validation_notes: list[str] = Field(default_factory=list)
 
     @field_validator("quality_metrics")
     @classmethod

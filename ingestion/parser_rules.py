@@ -1,8 +1,8 @@
 import re
 
 # Regex for Romanian legal structures
-# Handles variations like "Art. 41", "Art. 41^1", etc.
-ARTICLE_RE = re.compile(r'^(?:Art\.|Articolul)\s*(\d+(?:\^\d+)?)', re.IGNORECASE)
+# Handles variations like "Art. 41", "Art. 41^1", "Art. 41¹", etc.
+ARTICLE_RE = re.compile(r'^(?:Art\.|Articolul)\s*(\d+(?:\^\d+|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)?)', re.IGNORECASE)
 
 # Handles paragraph numbers like "(1)", "(2)"
 PARA_RE = re.compile(r'^\((\d+)\)')
