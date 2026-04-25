@@ -40,7 +40,12 @@ def _require_admin(x_admin_secret: str | None) -> None:
 
 
 def _run_batch_task(run_id: str, write_debug: bool) -> None:
-    cmd = [sys.executable, str(_REPO_ROOT / "scripts" / "run_batch_pipeline.py")]
+    sources_file = _REPO_ROOT / "ingestion" / "sources" / "demo_sources.yaml"
+    cmd = [
+        sys.executable,
+        str(_REPO_ROOT / "scripts" / "run_batch_pipeline.py"),
+        "--sources-file", str(sources_file),
+    ]
     if write_debug:
         cmd.append("--write-debug")
 
@@ -65,9 +70,10 @@ async def trigger_batch_ingest(
     _require_admin(x_admin_secret)
 
     sys.path.insert(0, str(_REPO_ROOT))
-    from ingestion.batch import DEFAULT_SOURCES_FILE, load_url_sources
+    from ingestion.batch import load_url_sources
 
-    url_sources = load_url_sources(DEFAULT_SOURCES_FILE)
+    sources_file = _REPO_ROOT / "ingestion" / "sources" / "demo_sources.yaml"
+    url_sources = load_url_sources(sources_file)
 
     run_id = str(uuid.uuid4())[:8]
     _jobs[run_id] = {"status": "queued"}
