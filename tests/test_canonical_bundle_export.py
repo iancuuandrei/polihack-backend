@@ -159,8 +159,9 @@ def test_validation_report_includes_v1_unknown_policy_warnings():
     assert report["quality_metrics"]["duplicate_free_score"] == 1.0
     assert report["quality_metrics"]["hierarchy_integrity"] == 1.0
     assert report["quality_metrics"]["source_url_coverage"] == 0.0
+    assert report["quality_metrics"]["text_cleanliness"] == 1.0
     assert report["quality_metrics"]["reference_resolution_rate"] == 0.0
-    assert report["corpus_quality"] == 0.7143
+    assert report["corpus_quality"] == 0.75
     assert report["import_blocking_passed"] is True
     assert "unknown_fields_left_null_by_policy" in warnings
     assert "source_url_unknown" in warnings

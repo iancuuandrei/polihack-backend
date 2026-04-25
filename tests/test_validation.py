@@ -103,10 +103,21 @@ class TestBuildValidationReport:
         report = build_validation_report(CLEAN_UNITS, CONTAINS_EDGES, REF_CANDIDATES_MIXED)
         assert report["total_units"] == len(CLEAN_UNITS)
         assert report["total_contains_edges"] == len(CONTAINS_EDGES)
+        assert report["text_cleanliness"] == 1.0
 
     def test_warnings_present_for_orphans(self):
         report = build_validation_report(CLEAN_UNITS, CONTAINS_EDGES, [])
         assert any("orphan" in w.lower() for w in report["warnings"])
+
+    def test_text_cleanliness_penalizes_navigation_residue(self):
+        noisy_units = CLEAN_UNITS + [
+            {"id": "ro.test.art_3", "type": "articol", "raw_text": "Meniu Cautare Acasa"},
+        ]
+
+        report = build_validation_report(noisy_units, CONTAINS_EDGES, [])
+
+        assert report["text_cleanliness"] < 1.0
+        assert any("navigation residue" in warning.lower() for warning in report["warnings"])
 
 
 # ---------------------------------------------------------------------------

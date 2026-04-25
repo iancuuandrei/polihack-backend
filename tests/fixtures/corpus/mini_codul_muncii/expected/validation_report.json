@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "parser_version": "0.1.0",
-  "corpus_quality": 0.7143,
+  "corpus_quality": 0.75,
   "import_blocking_passed": true,
   "units_count": 6,
   "edges_count": 5,
@@ -14,6 +14,7 @@
     "source_url_coverage": 0.0,
     "raw_text_non_empty_rate": 1.0,
     "stable_id_rate": 1.0,
+    "text_cleanliness": 1.0,
     "reference_resolution_rate": 0.0
   },
   "warnings": [

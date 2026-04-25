@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from pydantic import BaseModel
 
 from ingestion.contracts import ParserActMetadata, ParsedLegalUnit
+from ingestion.html_cleaner import navigation_residue_count, text_cleanliness_score
 from ingestion.legal_domains import get_registered_legal_domain
 from ingestion.legal_ids import (
     make_canonical_id,
@@ -348,6 +349,9 @@ def build_canonical_validation_report(
         sum(1 for unit in legal_units if _has_minimum_legal_unit_fields(unit)),
         units_count,
     )
+    text_cleanliness = text_cleanliness_score(
+        [str(unit.get("raw_text") or "") for unit in legal_units]
+    )
     reference_resolution_rate = (
         _safe_rate(
             sum(
@@ -368,6 +372,7 @@ def build_canonical_validation_report(
         "source_url_coverage": source_url_coverage,
         "raw_text_non_empty_rate": raw_text_non_empty_rate,
         "stable_id_rate": stable_id_rate,
+        "text_cleanliness": text_cleanliness,
         "reference_resolution_rate": reference_resolution_rate,
     }
     warnings = _canonical_bundle_warnings(
@@ -571,6 +576,8 @@ def _canonical_bundle_warnings(
         warnings.add("reference_candidates_not_implemented_or_not_all_resolved")
     if any(unit.get("legal_domain") == "unknown" for unit in legal_units):
         warnings.add("legal_domain_unknown")
+    if any(navigation_residue_count(str(unit.get("raw_text") or "")) for unit in legal_units):
+        warnings.add("possible_navigation_residue")
     return sorted(warnings)
 
 
