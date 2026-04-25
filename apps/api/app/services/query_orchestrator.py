@@ -2,14 +2,21 @@ from uuid import NAMESPACE_URL, uuid5
 
 from ..schemas import QueryDebugData, QueryRequest, QueryResponse
 from .mock_evidence import MockEvidenceService
+from .query_understanding import QueryUnderstanding
 
 
 class QueryOrchestrator:
-    def __init__(self, evidence_service: MockEvidenceService | None = None) -> None:
+    def __init__(
+        self,
+        evidence_service: MockEvidenceService | None = None,
+        query_understanding: QueryUnderstanding | None = None,
+    ) -> None:
         self.evidence_service = evidence_service or MockEvidenceService()
+        self.query_understanding = query_understanding or QueryUnderstanding()
 
     async def run(self, request: QueryRequest) -> QueryResponse:
         query_id = self._query_id(request)
+        query_plan = self.query_understanding.build_plan(request)
         evidence_pack = await self.evidence_service.build_pack(request, query_id)
         debug = None
         if request.debug:
@@ -17,6 +24,7 @@ class QueryOrchestrator:
                 orchestrator=self.__class__.__name__,
                 evidence_service=self.evidence_service.__class__.__name__,
                 retrieval_mode="mock_static_fixture",
+                query_understanding=query_plan,
                 evidence_units_count=len(evidence_pack.evidence_units),
                 citations_count=len(evidence_pack.citations),
                 graph_nodes_count=len(evidence_pack.graph.nodes),

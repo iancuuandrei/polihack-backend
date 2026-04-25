@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -93,10 +93,37 @@ class VerifierStatus(BaseModel):
     refusal_reason: str | None = None
 
 
+class QueryPlan(BaseModel):
+    question: str
+    normalized_question: str
+    legal_domain: str | None = None
+    domain_confidence: float = Field(..., ge=0.0, le=1.0)
+    domain_scores: dict[str, float] = Field(default_factory=dict)
+    query_types: list[
+        Literal[
+            "right",
+            "obligation",
+            "prohibition",
+            "sanction",
+            "procedure",
+            "definition",
+            "exception",
+        ]
+    ] = Field(default_factory=list)
+    exact_citations: list[str] = Field(default_factory=list)
+    temporal_context: str | None = None
+    ambiguity_flags: list[str] = Field(default_factory=list)
+    safety_flags: list[str] = Field(default_factory=list)
+    should_refuse_early: bool = False
+    retrieval_filters: dict[str, Any] = Field(default_factory=dict)
+    expansion_policy: dict[str, Any] = Field(default_factory=dict)
+
+
 class QueryDebugData(BaseModel):
     orchestrator: str
     evidence_service: str
     retrieval_mode: str
+    query_understanding: QueryPlan | None = None
     evidence_units_count: int = Field(..., ge=0)
     citations_count: int = Field(..., ge=0)
     graph_nodes_count: int = Field(..., ge=0)
