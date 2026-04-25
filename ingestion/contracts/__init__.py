@@ -123,9 +123,12 @@ class ParsedLegalUnit(IngestionContract):
     incoming_reference_ids: list[str] = Field(default_factory=list)
     parser_warnings: list[str] = Field(default_factory=list)
 
-    def to_legal_unit_dict(self) -> dict[str, Any]:
-        """Return the API LegalUnit-compatible shape used by retrieval/evidence."""
-        return self.model_dump(include=LEGAL_UNIT_FIELDS)
+    def to_legal_unit_dict(self, *, include_parser_warnings: bool = False) -> dict[str, Any]:
+        """Return the LegalUnit shape used by retrieval/evidence."""
+        fields = set(LEGAL_UNIT_FIELDS)
+        if include_parser_warnings:
+            fields.add("parser_warnings")
+        return self.model_dump(include=fields)
 
 
 class ParsedLegalEdge(IngestionContract):
