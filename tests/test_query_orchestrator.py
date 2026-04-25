@@ -53,14 +53,18 @@ async def test_query_orchestrator_generates_grounded_draft_with_debug():
             if unit.id == citation.legal_unit_id
         )
         assert citation.quote in evidence.raw_text
-        assert citation.verified is False
-    assert response.verifier.verifier_passed is False
-    assert response.verifier.citations_checked == 0
+        assert citation.verified is True
+    assert response.verifier.citations_checked == len(response.citations)
+    assert response.verifier.claims_total > 0
     warnings = " ".join(response.warnings + response.verifier.warnings)
-    assert "CitationVerifier has not run yet" in warnings
+    assert "CitationVerifier has not run yet" not in warnings
+    assert "generation_unverified_citation_verifier_not_run" not in warnings
+    assert "nu a fost verificat final de CitationVerifier" not in response.answer.short_answer
+    assert "CitationVerifier V1" in response.answer.short_answer
     assert response.debug.generation["generation_mode"] == "deterministic_extractive_v1"
     assert response.debug.generation["evidence_unit_count_used"] == len(response.citations)
     assert set(response.debug.generation["citation_unit_ids"]) == citation_ids
+    assert response.debug.verifier["claim_extraction"]["claims_total"] > 0
 
 
 @pytest.mark.anyio
@@ -78,4 +82,5 @@ async def test_query_orchestrator_omits_generation_debug_when_debug_false():
     assert response.debug is None
     assert response.citations
     assert response.answer.confidence == 0.0
-    assert response.verifier.verifier_passed is False
+    assert response.verifier.citations_checked == len(response.citations)
+    assert response.verifier.claims_total > 0

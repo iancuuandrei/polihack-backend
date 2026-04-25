@@ -10,8 +10,8 @@ from ..schemas import (
     QueryDebugData,
     QueryRequest,
     QueryResponse,
-    VerifierStatus,
 )
+from .citation_verifier import CitationVerifier
 from .evidence_pack_compiler import EvidencePackCompiler
 from .generation_adapter import (
     GENERATION_FAILED,
@@ -38,6 +38,7 @@ class QueryOrchestrator:
         legal_ranker: LegalRanker | None = None,
         evidence_pack_compiler: EvidencePackCompiler | None = None,
         generation_adapter: GenerationAdapter | None = None,
+        citation_verifier: CitationVerifier | None = None,
     ) -> None:
         self.evidence_service = evidence_service or MockEvidenceService()
         self.query_understanding = query_understanding or QueryUnderstanding()
@@ -50,6 +51,7 @@ class QueryOrchestrator:
             evidence_pack_compiler or EvidencePackCompiler()
         )
         self.generation_adapter = generation_adapter or GenerationAdapter()
+        self.citation_verifier = citation_verifier or CitationVerifier()
 
     async def run(self, request: QueryRequest) -> QueryResponse:
         query_id = self._query_id(request)
@@ -82,16 +84,24 @@ class QueryOrchestrator:
             evidence_units=compiled_evidence.evidence_units,
             mode=request.mode,
         )
-        evidence_pack = await self.evidence_service.build_pack(request, query_id)
         answer = self._answer_payload(draft_answer)
         citations = self._citations_from_draft(
             draft_answer,
             compiled_evidence.evidence_units,
         )
-        verifier = self._unverified_status(
-            evidence_pack.verifier,
-            draft_answer=draft_answer,
+        verification = self.citation_verifier.verify(
             answer=answer,
+            citations=citations,
+            evidence_units=compiled_evidence.evidence_units,
+            debug=request.debug,
+        )
+        answer = self._answer_after_verification(
+            answer,
+            verifier_passed=verification.verifier.verifier_passed,
+        )
+        citations = self._mark_verified_citations(
+            citations,
+            verification.verified_citation_ids,
         )
         graph = GraphPayload(
             nodes=compiled_evidence.graph_nodes,
@@ -108,12 +118,15 @@ class QueryOrchestrator:
                 graph_expansion=graph_expansion.debug,
                 legal_ranker=legal_ranker.debug,
                 evidence_pack=compiled_evidence.debug,
-                generation=self._generation_debug(draft_answer),
+                generation=self._generation_debug(draft_answer, verifier_ran=True),
+                verifier=verification.debug,
                 evidence_units_count=len(compiled_evidence.evidence_units),
                 citations_count=len(citations),
                 graph_nodes_count=len(graph.nodes),
                 graph_edges_count=len(graph.edges),
-                notes=evidence_pack.debug_notes,
+                notes=[
+                    "GenerationAdapter and CitationVerifier V1 ran over compiled EvidencePack.",
+                ],
             )
 
         return QueryResponse(
@@ -122,16 +135,16 @@ class QueryOrchestrator:
             answer=answer,
             citations=citations,
             evidence_units=compiled_evidence.evidence_units,
-            verifier=verifier,
+            verifier=verification.verifier,
             graph=graph,
             debug=debug,
-            warnings=(
-                evidence_pack.warnings
-                + raw_retrieval.warnings
+            warnings=self._dedupe(
+                raw_retrieval.warnings
                 + graph_expansion.warnings
                 + legal_ranker.warnings
                 + compiled_evidence.warnings
-                + draft_answer.warnings
+                + self._generation_warnings(draft_answer, verifier_ran=True)
+                + verification.warnings
             ),
         )
 
@@ -177,6 +190,48 @@ class QueryOrchestrator:
             refusal_reason=refusal_reason,
         )
 
+    def _answer_after_verification(
+        self,
+        answer: AnswerPayload,
+        *,
+        verifier_passed: bool,
+    ) -> AnswerPayload:
+        status = (
+            "a trecut verificarea determinista CitationVerifier V1; "
+            "LegalConfidence final nu este calculat inca"
+            if verifier_passed
+            else "a fost verificat determinist de CitationVerifier V1, "
+            "dar verifier_passed=false; vezi warnings"
+        )
+        replacements = {
+            "nu a fost verificat final de CitationVerifier": status,
+            "CitationVerifier real nu a rulat inca": status,
+        }
+        return answer.model_copy(
+            update={
+                "short_answer": self._replace_status_text(
+                    answer.short_answer,
+                    replacements,
+                ),
+                "detailed_answer": self._replace_status_text(
+                    answer.detailed_answer,
+                    replacements,
+                )
+                if answer.detailed_answer
+                else None,
+            }
+        )
+
+    def _replace_status_text(
+        self,
+        text: str,
+        replacements: dict[str, str],
+    ) -> str:
+        updated = text
+        for old, new in replacements.items():
+            updated = updated.replace(old, new)
+        return updated
+
     def _citations_from_draft(
         self,
         draft_answer: DraftAnswer,
@@ -201,42 +256,49 @@ class QueryOrchestrator:
             )
         return citations
 
-    def _unverified_status(
+    def _mark_verified_citations(
         self,
-        verifier: VerifierStatus,
-        *,
-        draft_answer: DraftAnswer,
-        answer: AnswerPayload,
-    ) -> VerifierStatus:
-        return verifier.model_copy(
-            update={
-                "groundedness_score": 0.0,
-                "claims_total": 0,
-                "claims_supported": 0,
-                "claims_weakly_supported": 0,
-                "claims_unsupported": 0,
-                "citations_checked": 0,
-                "verifier_passed": False,
-                "claim_results": [],
-                "warnings": self._dedupe(
-                    verifier.warnings
-                    + draft_answer.warnings
-                    + [GENERATION_UNVERIFIED_WARNING]
-                ),
-                "repair_applied": False,
-                "refusal_reason": answer.refusal_reason,
-            }
-        )
+        citations: list[Citation],
+        verified_citation_ids: set[str],
+    ) -> list[Citation]:
+        return [
+            citation.model_copy(
+                update={"verified": citation.citation_id in verified_citation_ids}
+            )
+            for citation in citations
+        ]
 
-    def _generation_debug(self, draft_answer: DraftAnswer) -> dict[str, object]:
+    def _generation_debug(
+        self,
+        draft_answer: DraftAnswer,
+        *,
+        verifier_ran: bool,
+    ) -> dict[str, object]:
         return {
             "generation_mode": draft_answer.generation_mode,
             "evidence_unit_count_used": len(draft_answer.used_evidence_unit_ids),
-            "warnings": draft_answer.warnings,
+            "warnings": self._generation_warnings(
+                draft_answer,
+                verifier_ran=verifier_ran,
+            ),
             "citation_unit_ids": [
                 citation.unit_id for citation in draft_answer.citations
             ],
         }
+
+    def _generation_warnings(
+        self,
+        draft_answer: DraftAnswer,
+        *,
+        verifier_ran: bool,
+    ) -> list[str]:
+        if not verifier_ran:
+            return draft_answer.warnings
+        return [
+            warning
+            for warning in draft_answer.warnings
+            if warning != GENERATION_UNVERIFIED_WARNING
+        ]
 
     def _dedupe(self, values: list[str]) -> list[str]:
         deduped: list[str] = []

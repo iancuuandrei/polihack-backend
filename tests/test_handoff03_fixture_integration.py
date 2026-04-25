@@ -195,12 +195,18 @@ async def test_query_orchestrator_returns_real_evidence_units_for_demo_fixture()
     assert "ro.codul_muncii.art_17.alin_3.lit_k" in citation_ids
     assert citation_ids <= set(evidence_ids)
     assert response.answer.confidence == 0.0
-    assert response.verifier.verifier_passed is False
+    assert response.verifier.citations_checked == len(response.citations)
+    assert response.verifier.claims_total > 0
+    assert response.verifier.groundedness_score > 0.0
+    assert "mock" not in " ".join(response.verifier.warnings).lower()
     assert response.debug.retrieval["candidate_count"] >= 4
     assert response.debug.evidence_pack["selected_evidence_count"] == 4
     assert response.debug.evidence_units_count == 4
     assert response.debug.citations_count == len(response.citations)
     assert response.debug.generation["generation_mode"] == "deterministic_extractive_v1"
+    assert response.debug.verifier["claim_extraction"]["claims_total"] > 0
     assert response.debug.legal_ranker["ranked_candidate_count"] >= 4
     assert response.debug.graph_expansion["fallback_used"] is False
-    assert "mock_no_legal_conclusion" in " ".join(response.warnings)
+    assert "CitationVerifier has not run yet" not in " ".join(response.warnings)
+    assert "generation_unverified_citation_verifier_not_run" not in " ".join(response.warnings)
+    assert "nu a fost verificat final de CitationVerifier" not in response.answer.short_answer
