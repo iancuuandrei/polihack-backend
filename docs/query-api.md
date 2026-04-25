@@ -1,10 +1,11 @@
 # Query API
 
-Phase 5 exposes the `/api/query` contract, deterministic QueryUnderstanding,
+Phase 7 exposes the `/api/query` contract, deterministic QueryUnderstanding,
 DomainRouter debug data, ExactCitationDetector output, RawRetrieverClient
-request construction, GraphExpansionPolicy debug data, and a deterministic mock
-EvidencePack only. It is intended for frontend and API integration work before
-real retrieval, graph traversal, and answer generation are available.
+request construction, GraphExpansionPolicy debug data, LegalRanker debug data,
+and EvidencePackCompiler MMR selection. It is intended for frontend and API
+integration work before real retrieval, graph traversal, answer generation, and
+citation verification are available.
 
 Not implemented yet:
 
@@ -12,7 +13,6 @@ Not implemented yet:
 - `/api/retrieve/raw`, which is owned by Handoff 04
 - graph/neighbors endpoints, which are owned by Handoff 04
 - database-backed graph expansion
-- LegalRanker
 - answer generation
 - citation verification
 
@@ -20,9 +20,12 @@ The query understanding layer is rule-based and inspectable. It does not call an
 LLM and it does not retrieve legal text. Exact citations are parsed only into
 future lookup hints; they are not resolved against `legal_units` yet.
 RawRetrieverClient prepares the future raw retrieval payload. GraphExpansionPolicy
-turns raw retrieval candidates into graph expansion seeds and policy metadata. If
-raw retrieval or graph neighbors are not configured, `/api/query` returns a safe
-fallback with `confidence: 0.0`, `verifier_passed: false`, and explicit warnings.
+turns raw retrieval candidates into graph expansion seeds and policy metadata.
+LegalRanker reranks raw and expanded candidates deterministically when they
+exist. EvidencePackCompiler selects and diversifies ranked candidates with MMR
+when candidates include LegalUnit text. If raw retrieval or graph neighbors are
+not configured, `/api/query` returns a safe fallback with empty evidence,
+`confidence: 0.0`, `verifier_passed: false`, and explicit warnings.
 
 ## Request
 
@@ -45,23 +48,14 @@ curl -X POST http://localhost:8000/api/query \
   "query_id": "9f8d85df-8d8b-59d5-b905-f76c351c7f10",
   "question": "Poate angajatorul sa-mi scada salariul fara act aditional?",
   "answer": {
-    "short_answer": "Phase 1 mock response only. No verified legal conclusion is provided; the evidence below is deterministic placeholder data for API contract testing.",
+    "short_answer": "Phase 1 mock response only. No verified legal conclusion is provided; Phase 7 may compile evidence units separately, but generation is not configured.",
     "detailed_answer": null,
     "confidence": 0.0,
     "not_legal_advice": true,
     "refusal_reason": "mock_evidence_pack_not_verified"
   },
-  "citations": [
-    {
-      "citation_id": "mock-citation-1",
-      "evidence_id": "mock-evidence-1",
-      "legal_unit_id": "mock:ro:codul-muncii:art-17",
-      "label": "Codul muncii art. 17 (mock, unverified)",
-      "quote": "Mock excerpt for art. 17. This placeholder was not retrieved from an official source.",
-      "source_url": null,
-      "verified": false
-    }
-  ],
+  "citations": [],
+  "evidence_units": [],
   "verifier": {
     "groundedness_score": 0.0,
     "claims_total": 0,
@@ -72,7 +66,7 @@ curl -X POST http://localhost:8000/api/query \
     "verifier_passed": false,
     "claim_results": [],
     "warnings": [
-      "mock_unverified_evidence_pack: Phase 1 returns deterministic mock evidence only; retrieval, LegalRanker, generation, and citation verification have not run."
+      "mock_unverified_answer: Phase 7 keeps answer generation and citation verification mocked; compiled evidence, if present, is not converted into a verified legal conclusion."
     ],
     "repair_applied": false,
     "refusal_reason": "mock_evidence_pack_not_verified"
@@ -80,9 +74,52 @@ curl -X POST http://localhost:8000/api/query \
 }
 ```
 
+When ranked candidates contain LegalUnit text, `evidence_units` use a flat
+LegalUnit-plus-evidence shape. The LegalUnit fields are not nested under
+`legal_unit`.
+
+```json
+{
+  "evidence_units": [
+    {
+      "id": "ro.codul_muncii.art_41",
+      "law_id": "ro.codul_muncii",
+      "law_title": "Codul muncii",
+      "status": "active",
+      "hierarchy_path": ["Codul muncii", "art. 41"],
+      "article_number": "41",
+      "paragraph_number": null,
+      "raw_text": "Contractul individual de munca poate fi modificat prin acordul partilor.",
+      "normalized_text": null,
+      "legal_domain": "munca",
+      "legal_concepts": ["contract", "salariu"],
+      "source_url": "https://legislatie.just.ro/test",
+      "evidence_id": "evidence:ro.codul_muncii.art_41",
+      "excerpt": "Contractul individual de munca poate fi modificat prin acordul partilor.",
+      "rank": 1,
+      "relevance_score": 0.86,
+      "retrieval_method": "raw_retrieval",
+      "retrieval_score": 0.78,
+      "rerank_score": 0.86,
+      "mmr_score": 0.645,
+      "support_role": "direct_basis",
+      "why_selected": ["domain_match:munca", "selected_by_mmr"],
+      "score_breakdown": {
+        "bm25_score": 0.9,
+        "dense_score": 0.7,
+        "domain_match": 1.0,
+        "graph_proximity": 1.0
+      },
+      "warnings": []
+    }
+  ]
+}
+```
+
 When `debug` is `true`, the response includes a `debug` object with mock service
-counts, notes, `query_understanding`, `retrieval`, and `graph_expansion`. When
-`debug` is `false`, `debug` is `null`.
+counts, notes, `query_understanding`, `retrieval`, `graph_expansion`,
+`legal_ranker`, and `evidence_pack`. When `debug` is `false`, `debug` is
+`null`.
 
 Example debug excerpt:
 
@@ -104,6 +141,87 @@ Example debug excerpt:
         "max_depth": 2,
         "max_expanded_nodes": 80
       }
+    }
+  }
+}
+```
+
+LegalRanker debug excerpt when no candidates are available:
+
+```json
+{
+  "debug": {
+    "legal_ranker": {
+      "fallback_used": true,
+      "input_candidate_count": 0,
+      "ranked_candidate_count": 0,
+      "weights": {
+        "bm25_score": 0.16,
+        "dense_score": 0.16,
+        "exact_citation_match": 0.1,
+        "domain_match": 0.1,
+        "graph_proximity": 0.1,
+        "concept_overlap": 0.08,
+        "legal_term_overlap": 0.07,
+        "temporal_validity": 0.07,
+        "source_reliability": 0.05,
+        "parent_relevance": 0.05,
+        "is_exception": 0.03,
+        "is_definition": 0.02,
+        "is_sanction": 0.01
+      },
+      "ranked_candidates": [],
+      "rows": [],
+      "warnings": ["legal_ranker_no_candidates"]
+    }
+  }
+}
+```
+
+EvidencePackCompiler debug excerpt when no ranked candidates are available:
+
+```json
+{
+  "debug": {
+    "evidence_pack": {
+      "fallback_used": true,
+      "input_ranked_candidate_count": 0,
+      "candidate_pool_size": 0,
+      "selected_evidence_count": 0,
+      "lambda": 0.75,
+      "target_evidence_units": 12,
+      "max_evidence_units": 14,
+      "selected_units": [],
+      "warnings": ["evidence_pack_no_ranked_candidates"]
+    }
+  }
+}
+```
+
+EvidencePackCompiler debug excerpt with ranked fixture candidates:
+
+```json
+{
+  "debug": {
+    "evidence_pack": {
+      "fallback_used": false,
+      "input_ranked_candidate_count": 1,
+      "candidate_pool_size": 1,
+      "selected_evidence_count": 1,
+      "selected_units": [
+        {
+          "unit_id": "ro.codul_muncii.art_41",
+          "rerank_score": 0.86,
+          "mmr_score": 0.645,
+          "support_role": "direct_basis",
+          "why_selected": [
+            "domain_match:munca",
+            "high_bm25_score",
+            "selected_by_mmr"
+          ]
+        }
+      ],
+      "warnings": ["evidence_pack_partial"]
     }
   }
 }
