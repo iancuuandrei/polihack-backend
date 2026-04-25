@@ -27,17 +27,31 @@ from ingestion.validators import build_validation_report, save_validation_report
 from ingestion.manifest import build_manifest, save_manifest
 
 
-def run_pipeline(url: str, law_id: str, out_dir: Path):
+def run_pipeline(url: Optional[str], file_path: Optional[str], law_id: str, out_dir: Path):
     print(f"\n=== AntiGravity Single Ingestion Pipeline ===")
-    print(f"URL     : {url}")
+    if url:
+        print(f"URL     : {url}")
+    if file_path:
+        print(f"File    : {file_path}")
     print(f"Law ID  : {law_id}")
     print(f"Output  : {out_dir}\n")
 
-    # 1. Scrape
-    print(f"[*] Scraping HTML source...")
-    html = scrape_html_source(url)
+    # 1. Get HTML Source
+    html = None
+    if url:
+        print(f"[*] Scraping HTML source from URL...")
+        html = scrape_html_source(url)
+    elif file_path:
+        print(f"[*] Reading HTML source from file...")
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                html = f.read()
+        except Exception as e:
+            print(f"[FATAL] Failed to read file: {e}")
+            sys.exit(1)
+
     if not html:
-        print("[FATAL] Failed to scrape HTML.")
+        print("[FATAL] No HTML content provided or found.")
         sys.exit(1)
 
     # 2. Extract Metadata & Clean Text
@@ -56,13 +70,10 @@ def run_pipeline(url: str, law_id: str, out_dir: Path):
     parser = AtomicParser(corpus_id=law_id)
     units, contains_edges = parser.parse(clean_text)
     
-    # 4. Extract Reference Candidates (AtomicParser already does basic extraction)
-    # But we need them in the format the resolver expects
+    # 4. Extract Reference Candidates
     from ingestion.reference_extractor import extract_references
     all_candidates = []
     for unit in units:
-        # AtomicParser provides 'references' but we re-run extraction 
-        # to ensure we have 'source_unit_id' for the resolver
         candidates = extract_references({"id": unit["id"], "raw_text": unit["text"]})
         all_candidates.extend(candidates)
 
@@ -99,7 +110,7 @@ def run_pipeline(url: str, law_id: str, out_dir: Path):
     sources_mock = [{
         "law_id": law_id,
         "law_title": law_title,
-        "url": url
+        "url": url or file_path
     }]
     manifest = build_manifest(out_dir.name, sources_mock, out_dir)
     save_manifest(manifest, out_dir / "corpus_manifest.json")
@@ -108,13 +119,16 @@ def run_pipeline(url: str, law_id: str, out_dir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest a single law from a URL")
-    parser.add_argument("--url", required=True, help="The URL to scrape")
+    parser = argparse.ArgumentParser(description="Ingest a single law from a URL or HTML file")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--url", help="The URL to scrape")
+    group.add_argument("--file", help="Path to a local HTML file")
+    
     parser.add_argument("--law-id", required=True, help="Deterministic ID (e.g. ro.lege_123_2023)")
     parser.add_argument("--out-dir", required=True, help="Where to save the JSON bundle")
     
     args = parser.parse_args()
-    run_pipeline(args.url, args.law_id, Path(args.out_dir))
+    run_pipeline(args.url, args.file, args.law_id, Path(args.out_dir))
 
 
 if __name__ == "__main__":
