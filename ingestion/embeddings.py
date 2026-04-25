@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar
 
@@ -18,6 +19,7 @@ from ingestion.contracts import EmbeddingInputRecord
 
 ResumeKey = tuple[str, str, str]
 T = TypeVar("T")
+EMBEDDINGS_IMPORT_READINESS_VALIDATOR_VERSION = "h07.phase5.import_readiness.v1"
 EMBEDDING_OUTPUT_REQUIRED_FIELDS = (
     "record_id",
     "chunk_id",
@@ -89,6 +91,48 @@ class EmbeddingOutputValidationSummary(BaseModel):
     empty_metadata_count: int = 0
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+
+class EmbeddingInputOutputValidationSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_read_count: int = 0
+    output_read_count: int = 0
+    embeddable_input_count: int = 0
+    matched_output_count: int = 0
+    missing_output_count: int = 0
+    orphan_output_count: int = 0
+    identity_mismatch_count: int = 0
+    duplicate_input_record_id_count: int = 0
+    duplicate_output_resume_key_count: int = 0
+    unexpected_output_for_empty_input_count: int = 0
+    model_names: list[str] = Field(default_factory=list)
+    embedding_dims: list[int] = Field(default_factory=list)
+    law_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class EmbeddingsImportReadinessManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_path: str
+    output_path: str
+    model_name: str
+    embedding_dim: int
+    input_read_count: int
+    output_read_count: int
+    embeddable_input_count: int
+    matched_output_count: int
+    missing_output_count: int
+    orphan_output_count: int
+    law_ids: list[str] = Field(default_factory=list)
+    model_names: list[str] = Field(default_factory=list)
+    embedding_dims: list[int] = Field(default_factory=list)
+    ready_for_pgvector_import: bool
+    validated_at: str
+    validator_version: str
+    warnings: list[str] = Field(default_factory=list)
 
 
 class EmbeddingProvider(Protocol):
@@ -424,6 +468,177 @@ def validate_embeddings_output(
     return summary
 
 
+def validate_embeddings_pair(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    expected_model: str | None = None,
+    expected_dim: int | None = None,
+    require_all_inputs: bool = True,
+    strict: bool = True,
+) -> EmbeddingInputOutputValidationSummary:
+    if expected_model is not None and not expected_model.strip():
+        raise ValueError("expected_model must be non-empty when provided")
+    if expected_dim is not None and expected_dim <= 0:
+        raise ValueError("expected_dim must be greater than 0")
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    output_summary = validate_embeddings_output(
+        output_path,
+        expected_model=expected_model,
+        expected_dim=expected_dim,
+        require_unique_resume_keys=True,
+        strict=False,
+    )
+    errors.extend(f"output: {message}" for message in output_summary.errors)
+    warnings.extend(f"output: {message}" for message in output_summary.warnings)
+
+    input_records = load_embedding_input_jsonl(input_path)
+    input_by_record_id: dict[str, EmbeddingInputRecord] = {}
+    embeddable_record_ids: set[str] = set()
+    non_embeddable_record_ids: set[str] = set()
+    duplicate_input_record_id_count = 0
+    for record in input_records:
+        if record.record_id in input_by_record_id:
+            duplicate_input_record_id_count += 1
+            errors.append(f"input record_id={record.record_id}: duplicate input record_id")
+            continue
+        input_by_record_id[record.record_id] = record
+        if record.embedding_text.strip():
+            embeddable_record_ids.add(record.record_id)
+        else:
+            non_embeddable_record_ids.add(record.record_id)
+
+    matched_output_count = 0
+    orphan_output_count = 0
+    identity_mismatch_count = 0
+    unexpected_output_for_empty_input_count = 0
+    matched_by_record_id: dict[str, set[str]] = {}
+    output_records: list[EmbeddingOutputRecord] = []
+    if not output_summary.errors:
+        output_records = load_embedding_output_jsonl(output_path)
+
+    for output in output_records:
+        input_record = input_by_record_id.get(output.record_id)
+        output_label = (
+            f"output record_id={output.record_id} "
+            f"model_name={output.model_name} text_hash={output.text_hash}"
+        )
+        if input_record is None:
+            orphan_output_count += 1
+            errors.append(f"{output_label}: orphan output record_id")
+            continue
+        if output.record_id in non_embeddable_record_ids:
+            unexpected_output_for_empty_input_count += 1
+            errors.append(f"{output_label}: unexpected output for non-embeddable input")
+            continue
+
+        mismatched_fields = [
+            field
+            for field in ("chunk_id", "legal_unit_id", "law_id", "text_hash")
+            if getattr(output, field) != getattr(input_record, field)
+        ]
+        if mismatched_fields:
+            identity_mismatch_count += 1
+            errors.append(
+                f"{output_label}: identity mismatch fields={','.join(mismatched_fields)}"
+            )
+            continue
+
+        matched_output_count += 1
+        matched_by_record_id.setdefault(output.record_id, set()).add(output.model_name)
+
+    missing_output_count = 0
+    for record_id in sorted(embeddable_record_ids):
+        matched_models = matched_by_record_id.get(record_id, set())
+        is_missing = expected_model not in matched_models if expected_model else not matched_models
+        if is_missing:
+            missing_output_count += 1
+            message = f"input record_id={record_id}: missing embedding output"
+            if require_all_inputs:
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+    summary = EmbeddingInputOutputValidationSummary(
+        input_read_count=len(input_records),
+        output_read_count=output_summary.read_count,
+        embeddable_input_count=len(embeddable_record_ids),
+        matched_output_count=matched_output_count,
+        missing_output_count=missing_output_count,
+        orphan_output_count=orphan_output_count,
+        identity_mismatch_count=identity_mismatch_count,
+        duplicate_input_record_id_count=duplicate_input_record_id_count,
+        duplicate_output_resume_key_count=output_summary.duplicate_resume_key_count,
+        unexpected_output_for_empty_input_count=unexpected_output_for_empty_input_count,
+        model_names=output_summary.model_names,
+        embedding_dims=output_summary.embedding_dims,
+        law_ids=output_summary.law_ids,
+        warnings=warnings,
+        errors=errors,
+    )
+    if strict and summary.errors:
+        preview = "; ".join(summary.errors[:5])
+        remaining = len(summary.errors) - min(len(summary.errors), 5)
+        suffix = f"; ... {remaining} more" if remaining else ""
+        raise ValueError(
+            "embedding pair validation failed: "
+            f"error_count={len(summary.errors)}; {preview}{suffix}"
+        )
+    return summary
+
+
+def build_embeddings_import_manifest(
+    *,
+    input_path: str | Path,
+    output_path: str | Path,
+    expected_model: str,
+    expected_dim: int,
+    manifest_path: str | Path | None = None,
+) -> EmbeddingsImportReadinessManifest:
+    if not expected_model.strip():
+        raise ValueError("expected_model must be non-empty")
+    if expected_dim <= 0:
+        raise ValueError("expected_dim must be greater than 0")
+
+    summary = validate_embeddings_pair(
+        input_path,
+        output_path,
+        expected_model=expected_model,
+        expected_dim=expected_dim,
+        require_all_inputs=True,
+        strict=True,
+    )
+    manifest = EmbeddingsImportReadinessManifest(
+        input_path=str(Path(input_path)),
+        output_path=str(Path(output_path)),
+        model_name=expected_model,
+        embedding_dim=expected_dim,
+        input_read_count=summary.input_read_count,
+        output_read_count=summary.output_read_count,
+        embeddable_input_count=summary.embeddable_input_count,
+        matched_output_count=summary.matched_output_count,
+        missing_output_count=summary.missing_output_count,
+        orphan_output_count=summary.orphan_output_count,
+        law_ids=summary.law_ids,
+        model_names=summary.model_names,
+        embedding_dims=summary.embedding_dims,
+        ready_for_pgvector_import=True,
+        validated_at=_utc_now_iso_z(),
+        validator_version=EMBEDDINGS_IMPORT_READINESS_VALIDATOR_VERSION,
+        warnings=summary.warnings,
+    )
+    if manifest_path is not None:
+        resolved_manifest_path = Path(manifest_path)
+        resolved_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_manifest_path.write_text(
+            json.dumps(manifest.model_dump(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return manifest
+
+
 def write_embedding_output_jsonl(
     records: list[EmbeddingOutputRecord],
     path: str | Path,
@@ -638,6 +853,10 @@ def _valid_output_embedding_dim(
         errors.append(f"{record_label}: embedding_dim must be a positive integer")
         return None
     return embedding_dim
+
+
+def _utc_now_iso_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _record_log_context(record: EmbeddingInputRecord, embedding_text_length: int) -> str:
