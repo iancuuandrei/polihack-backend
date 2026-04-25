@@ -62,6 +62,7 @@ def test_post_api_query_debug_true_includes_debug_payload():
     retrieval = debug["retrieval"]
     assert retrieval["fallback_used"] is True
     assert retrieval["request_payload"]["retrieval_filters"]["legal_domain"] == "muncă"
+    assert retrieval["request_payload"]["exact_citations"] == []
     assert retrieval["response_summary"]["candidate_count"] == 0
     assert "raw_retrieval_not_configured" in retrieval["response_summary"]["warnings"]
 
@@ -77,7 +78,7 @@ def test_post_api_query_debug_true_includes_exact_citations():
     response = post_query(
         {
             **VALID_QUERY,
-            "question": "Ce spune art. 41 din Codul muncii?",
+            "question": "Ce spune art. 41 alin. (1) din Codul muncii?",
             "debug": True,
         }
     )
@@ -88,13 +89,18 @@ def test_post_api_query_debug_true_includes_exact_citations():
     retrieval = payload["debug"]["retrieval"]
     assert payload["debug"]["query_understanding"]["legal_domain"] == "muncă"
     assert citation["article"] == "41"
+    assert citation["paragraph"] == "1"
     assert citation["law_id_hint"] == "ro.codul_muncii"
     request_payload = retrieval["request_payload"]
     assert request_payload["exact_citations"][0]["article"] == "41"
+    assert request_payload["exact_citations"][0]["paragraph"] == "1"
+    assert request_payload["exact_citations"][0]["act_hint"] == "Codul muncii"
     filters = request_payload["retrieval_filters"]["exact_citation_filters"][0]
     assert filters["article_number"] == "41"
+    assert filters["paragraph_number"] == "1"
     assert filters["law_id"] == "ro.codul_muncii"
     assert payload["answer"]["confidence"] == 0.0
+    assert payload["answer"]["refusal_reason"] == "mock_evidence_pack_not_verified"
     assert payload["verifier"]["verifier_passed"] is False
     assert "raw_retrieval_not_configured" in payload["warnings"]
 
