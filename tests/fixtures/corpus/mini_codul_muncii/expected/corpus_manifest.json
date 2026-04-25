@@ -24,8 +24,8 @@
     "validation_report": "validation_report.json",
     "reference_candidates": "reference_candidates.json"
   },
-  "content_hash": "13f9c179978794a0c02c58c8414036dbbc0d28864fee0e45daedb46f216a2d81",
-  "bundle_hash": "93507501ccc0e4b165fc01d04a62c45d4585ec0c5400c967af61d78a68dace44",
+  "content_hash": "9204cdf8e1021ffd27924f2a66e06dab9e7f06831d93e53ad76c77e7904db423",
+  "bundle_hash": "e0ecec7019ecfd85e147bc46b3db446ef98468a70021cbbd8d446bf05d8a4885",
   "warnings": [
     "legal_concepts_empty_for_most_units_by_v1_policy",
     "reference_candidates_not_implemented_or_not_all_resolved",

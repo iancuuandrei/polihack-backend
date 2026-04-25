@@ -8,6 +8,8 @@ Phase 3: build_validation_report – full quality report for a processed corpus.
 import json
 from typing import Any
 
+from ingestion.html_cleaner import text_cleanliness_score
+
 
 # ---------------------------------------------------------------------------
 # Phase 1 – Blocking duplicate ID check
@@ -79,6 +81,9 @@ def build_validation_report(
     report["ReferenceResolutionRate"] = (
         round(resolved_count / total_candidates, 4) if total_candidates > 0 else 0.0
     )
+    report["text_cleanliness"] = text_cleanliness_score(
+        [str(unit.get("raw_text") or "") for unit in units]
+    )
 
     # --- Orphan detection (warning) ---
     target_ids = {e["target_id"] for e in contains_edges}
@@ -96,6 +101,8 @@ def build_validation_report(
         )
     if duplicates:
         warnings.append(f"BLOCKING: {len(duplicates)} duplicate ID(s) found.")
+    if report["text_cleanliness"] < 1.0:
+        warnings.append("Possible navigation residue detected in raw_text.")
 
     report["warnings"] = warnings
 
