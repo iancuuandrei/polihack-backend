@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .settings import settings
+from ..config import settings
 
 
 def _to_async_url(url: str) -> str:
