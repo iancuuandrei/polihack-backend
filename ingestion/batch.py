@@ -13,9 +13,13 @@ DEFAULT_SOURCES_FILE = REPO_ROOT / "ingestion" / "sources" / "demo_sources.yaml"
 
 
 def load_url_sources(sources_file: Path) -> list[dict[str, Any]]:
+    print(f"[batch-pipeline] Reading sources from: {sources_file.resolve()}")
     with sources_file.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return [s for s in (data or {}).get("sources", []) if s.get("url")]
+    all_sources = (data or {}).get("sources", [])
+    url_sources = [s for s in all_sources if s.get("url")]
+    print(f"[batch-pipeline] Found {len(all_sources)} source(s), {len(url_sources)} with a URL.")
+    return url_sources
 
 
 def run_batch(sources_file: Path = DEFAULT_SOURCES_FILE, write_debug: bool = False) -> list[dict]:
