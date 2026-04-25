@@ -86,6 +86,20 @@ async def trigger_batch_ingest(
     )
 
 
+@router.get("/debug", include_in_schema=False)
+async def debug_paths(x_admin_secret: str | None = Header(default=None)) -> dict:
+    _require_admin(x_admin_secret)
+    sources_file = _REPO_ROOT / "ingestion" / "sources" / "demo_sources.yaml"
+    content = sources_file.read_text(encoding="utf-8") if sources_file.exists() else None
+    return {
+        "repo_root": str(_REPO_ROOT),
+        "sources_file": str(sources_file),
+        "sources_file_exists": sources_file.exists(),
+        "sources_file_content": content,
+        "python": sys.executable,
+    }
+
+
 @router.get("/ingest/batch/{run_id}", response_model=BatchStatusResponse)
 async def get_batch_status(
     run_id: str,
