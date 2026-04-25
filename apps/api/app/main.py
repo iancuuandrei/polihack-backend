@@ -4,9 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .db import dispose_engine
-from .routers.health import health, router as health_router
-from .routers.query import router as query_router
-from .settings import settings
+from .routes.health import health, router as health_router
+from .routes.query import router as query_router
+from .config import settings
 
 
 @asynccontextmanager
