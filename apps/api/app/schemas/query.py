@@ -151,10 +151,20 @@ class GraphPayload(BaseModel):
 class ClaimResult(BaseModel):
     claim_id: str
     claim_text: str
-    status: Literal["supported", "weakly_supported", "unsupported", "not_checked"]
+    status: Literal[
+        "strongly_supported",
+        "supported",
+        "weakly_supported",
+        "unsupported",
+        "not_checked",
+    ]
     citation_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(..., ge=0.0, le=1.0)
     warning: str | None = None
+    support_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    supporting_unit_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    score_breakdown: dict[str, float] = Field(default_factory=dict)
 
 
 class VerifierStatus(BaseModel):
@@ -238,6 +248,8 @@ class QueryDebugData(BaseModel):
     graph_expansion: dict[str, Any] | None = None
     legal_ranker: dict[str, Any] | None = None
     evidence_pack: dict[str, Any] | None = None
+    generation: dict[str, Any] | None = None
+    verifier: dict[str, Any] | None = None
     evidence_units_count: int = Field(..., ge=0)
     citations_count: int = Field(..., ge=0)
     graph_nodes_count: int = Field(..., ge=0)

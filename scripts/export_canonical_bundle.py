@@ -13,8 +13,10 @@ from ingestion.exporters import export_canonical_bundle
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export a canonical parser bundle from legacy units")
-    parser.add_argument("--input", required=True, help="Path to legacy legal_units.json")
+    parser = argparse.ArgumentParser(
+        description="Export a canonical parser bundle from structural intermediate units"
+    )
+    parser.add_argument("--input", required=True, help="Path to intermediate legal_units.json")
     parser.add_argument("--out-dir", required=True, help="Output directory for canonical bundle")
     parser.add_argument("--law-id", required=True, help="Canonical law id, e.g. ro.codul_muncii")
     parser.add_argument("--law-title", required=True, help="Law title, e.g. Codul muncii")
@@ -48,6 +50,15 @@ def main() -> None:
 
     for artifact, path in paths.items():
         print(f"{artifact}: {path}")
+
+    validation_report_path = paths["validation_report"]
+    validation_report = json.loads(validation_report_path.read_text(encoding="utf-8"))
+    if validation_report.get("import_blocking_passed") is False:
+        print(
+            "import_blocking_passed=false; canonical bundle is not import-ready",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
