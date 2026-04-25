@@ -1,8 +1,9 @@
 # Query API
 
-Phase 1 exposes the `/api/query` contract and returns a deterministic mock
-EvidencePack only. It is intended for frontend and API integration work before
-real retrieval and answer generation are available.
+Phase 2 exposes the `/api/query` contract, deterministic QueryUnderstanding,
+DomainRouter debug data, and a deterministic mock EvidencePack only. It is
+intended for frontend and API integration work before real retrieval and answer
+generation are available.
 
 Not implemented yet:
 
@@ -11,6 +12,9 @@ Not implemented yet:
 - LegalRanker
 - answer generation
 - citation verification
+
+The query understanding layer is rule-based and inspectable. It does not call an
+LLM and it does not retrieve legal text.
 
 ## Request
 
@@ -69,4 +73,30 @@ curl -X POST http://localhost:8000/api/query \
 ```
 
 When `debug` is `true`, the response includes a `debug` object with mock service
-counts and notes. When `debug` is `false`, `debug` is `null`.
+counts, notes, and `query_understanding`. When `debug` is `false`, `debug` is
+`null`.
+
+Example debug excerpt:
+
+```json
+{
+  "debug": {
+    "query_understanding": {
+      "legal_domain": "muncă",
+      "domain_confidence": 1.0,
+      "query_types": ["right", "prohibition", "obligation"],
+      "exact_citations": [],
+      "temporal_context": "current",
+      "retrieval_filters": {
+        "legal_domain": "muncă",
+        "status": "active",
+        "date_context": "current"
+      },
+      "expansion_policy": {
+        "max_depth": 2,
+        "max_expanded_nodes": 80
+      }
+    }
+  }
+}
+```

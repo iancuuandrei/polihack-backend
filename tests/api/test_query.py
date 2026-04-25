@@ -53,6 +53,12 @@ def test_post_api_query_debug_true_includes_debug_payload():
     assert debug["orchestrator"] == "QueryOrchestrator"
     assert debug["evidence_service"] == "MockEvidenceService"
     assert debug["evidence_units_count"] >= 3
+    assert debug["query_understanding"]["legal_domain"] == "muncă"
+    assert debug["query_understanding"]["domain_confidence"] >= 0.70
+    assert "prohibition" in debug["query_understanding"]["query_types"]
+    assert "obligation" in debug["query_understanding"]["query_types"]
+    assert debug["query_understanding"]["exact_citations"] == []
+    assert debug["query_understanding"]["retrieval_filters"]["status"] == "active"
 
 
 def test_post_api_query_debug_false_returns_null_debug():
