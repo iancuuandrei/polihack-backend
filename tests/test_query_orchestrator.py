@@ -56,7 +56,12 @@ async def test_query_orchestrator_generates_grounded_draft_with_debug():
         assert citation.verified is True
     assert response.verifier.citations_checked == len(response.citations)
     assert response.verifier.claims_total > 0
+    assert response.verifier.verifier_passed is True
+    assert response.verifier.repair_applied is False
     warnings = " ".join(response.warnings + response.verifier.warnings)
+    assert "answer_refused" not in warnings
+    assert "answer_repaired" not in warnings
+    assert "answer_tempered" not in warnings
     assert "CitationVerifier has not run yet" not in warnings
     assert "generation_unverified_citation_verifier_not_run" not in warnings
     assert "nu a fost verificat final de CitationVerifier" not in response.answer.short_answer
@@ -65,6 +70,8 @@ async def test_query_orchestrator_generates_grounded_draft_with_debug():
     assert response.debug.generation["evidence_unit_count_used"] == len(response.citations)
     assert set(response.debug.generation["citation_unit_ids"]) == citation_ids
     assert response.debug.verifier["claim_extraction"]["claims_total"] > 0
+    assert response.debug.answer_repair["repair_action"] == "none"
+    assert response.debug.answer_repair["warnings_added"] == []
 
 
 @pytest.mark.anyio
@@ -84,3 +91,4 @@ async def test_query_orchestrator_omits_generation_debug_when_debug_false():
     assert response.answer.confidence == 0.0
     assert response.verifier.citations_checked == len(response.citations)
     assert response.verifier.claims_total > 0
+    assert response.verifier.repair_applied is False
