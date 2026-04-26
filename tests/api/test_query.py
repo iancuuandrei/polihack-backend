@@ -253,7 +253,7 @@ async def test_query_orchestrator_populates_evidence_units_with_fake_candidates(
 def test_handoff04_graph_endpoints_are_not_registered():
     paths = {route.path for route in app.routes}
 
-    assert "/api/retrieve/raw" not in paths
+    assert "/api/retrieve/raw" in paths
     assert "/api/legal-units/{id}/neighbors" not in paths
     assert "/api/explore/root" not in paths
     assert "/api/explore/node/{id}/children" not in paths

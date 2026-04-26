@@ -69,7 +69,9 @@ class RawRetrieverClient:
         return RawRetrievalRequest(
             question=plan.question,
             retrieval_filters=plan.retrieval_filters,
-            exact_citations=plan.exact_citations,
+            exact_citations=[
+                citation.model_dump(mode="json") for citation in plan.exact_citations
+            ],
             top_k=top_k,
             debug=debug,
         )

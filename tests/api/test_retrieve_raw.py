@@ -1,0 +1,280 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from apps.api.app.main import app
+from apps.api.app.routes import retrieve_raw as retrieve_raw_route
+from apps.api.app.services.raw_retriever import EmptyRawRetrievalStore, RawRetriever
+
+
+def test_endpoint_schema_valid_with_dependency_override():
+    async def override_retriever():
+        return RawRetriever(FakeStore())
+
+    app.dependency_overrides[retrieve_raw_route.get_raw_retriever] = override_retriever
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/retrieve/raw",
+                json={
+                    "question": "Poate angajatorul sa-mi scada salariul fara act aditional?",
+                    "filters": {"legal_domain": "munca", "status": "active"},
+                    "exact_citations": [
+                        {"law_id": "ro.codul_muncii", "article_number": "41"}
+                    ],
+                    "top_k": 10,
+                    "debug": True,
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["candidates"]
+    assert payload["candidates"][0]["unit_id"] == "ro.codul_muncii.art_41"
+    assert payload["candidates"][0]["unit"]["raw_text"]
+    assert payload["debug"]["candidate_count"] >= 1
+    assert "query_embedding" not in payload
+
+
+def test_endpoint_without_database_url_returns_warning(monkeypatch):
+    import apps.api.app.db.session as db_module
+
+    monkeypatch.setattr(db_module.settings, "database_url", None)
+    monkeypatch.setattr(db_module, "_engine", None)
+    monkeypatch.setattr(db_module, "_sessionmaker", None)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/retrieve/raw",
+            json={
+                "question": "Poate angajatorul sa-mi scada salariul fara act aditional?",
+                "top_k": 5,
+                "debug": True,
+            },
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["candidates"] == []
+    assert any("database_unavailable" in warning for warning in payload["warnings"])
+
+
+@pytest.mark.anyio
+async def test_exact_citation_art_41_returns_matching_unit():
+    response = await RawRetriever(FakeStore()).retrieve(
+        _request(
+            exact_citations=[{"law_id": "ro.codul_muncii", "article_number": "41"}],
+            debug=True,
+        )
+    )
+
+    assert response.candidates
+    candidate = response.candidates[0]
+    assert candidate.unit_id == "ro.codul_muncii.art_41"
+    assert candidate.unit["article_number"] == "41"
+    assert candidate.score_breakdown["exact_citation_boost"] == 1.0
+    assert "exact citation" in candidate.why_retrieved
+
+
+@pytest.mark.anyio
+async def test_fts_query_returns_codul_muncii_candidates():
+    response = await RawRetriever(FakeStore()).retrieve(
+        _request(question="salariu act aditional", exact_citations=[])
+    )
+
+    assert response.candidates
+    assert response.candidates[0].unit["law_id"] == "ro.codul_muncii"
+    assert response.candidates[0].score_breakdown["bm25"] > 0.0
+    assert "lexical match" in response.candidates[0].why_retrieved
+
+
+@pytest.mark.anyio
+async def test_domain_filter_sets_domain_match():
+    response = await RawRetriever(FakeStore()).retrieve(
+        _request(filters={"legal_domain": "munca", "status": "active"})
+    )
+
+    assert response.candidates
+    assert all(
+        candidate.score_breakdown["domain_match"] == 1.0
+        for candidate in response.candidates
+    )
+
+
+@pytest.mark.anyio
+async def test_missing_or_empty_db_returns_warning_without_crash():
+    response = await RawRetriever(
+        EmptyRawRetrievalStore(),
+        initial_warnings=["database_unavailable"],
+    ).retrieve(_request())
+
+    assert response.candidates == []
+    assert "database_unavailable" in response.warnings
+
+
+@pytest.mark.anyio
+async def test_dense_retrieval_skipped_when_query_embedding_missing():
+    response = await RawRetriever(FakeStore()).retrieve(_request())
+
+    assert "dense_retrieval_skipped_no_query_embedding" in response.warnings
+    assert all(candidate.score_breakdown["dense"] == 0.0 for candidate in response.candidates)
+
+
+@pytest.mark.anyio
+async def test_dense_retrieval_uses_store_when_query_embedding_is_present():
+    store = FakeStore()
+    response = await RawRetriever(store).retrieve(
+        _request(query_embedding=[0.1, 0.2, 0.3], exact_citations=[])
+    )
+
+    assert store.dense_called is True
+    assert response.candidates
+    assert response.candidates[0].score_breakdown["dense"] > 0.0
+    assert "dense similarity" in " ".join(candidate.why_retrieved or "" for candidate in response.candidates)
+
+
+@pytest.mark.anyio
+async def test_score_breakdown_has_required_fields_and_top_k_is_respected():
+    response = await RawRetriever(FakeStore()).retrieve(
+        _request(top_k=1, exact_citations=[])
+    )
+
+    assert len(response.candidates) == 1
+    breakdown = response.candidates[0].score_breakdown
+    assert {
+        "bm25",
+        "dense",
+        "domain_match",
+        "metadata_validity",
+        "exact_citation_boost",
+    }.issubset(breakdown)
+
+
+@pytest.mark.anyio
+async def test_response_does_not_include_vectors():
+    response = await RawRetriever(FakeStore()).retrieve(
+        _request(query_embedding=[0.1, 0.2, 0.3])
+    )
+
+    payload = response.model_dump(mode="json")
+    assert "embedding" not in str(payload)
+    assert "0.1, 0.2, 0.3" not in str(payload)
+
+
+def _request(**overrides):
+    from apps.api.app.schemas import RawRetrievalRequest
+
+    payload = {
+        "question": "Poate angajatorul sa-mi scada salariul fara act aditional?",
+        "filters": {"legal_domain": "munca", "status": "active"},
+        "exact_citations": [
+            {"law_id": "ro.codul_muncii", "article_number": "41"}
+        ],
+        "top_k": 10,
+        "debug": False,
+    }
+    payload.update(overrides)
+    return RawRetrievalRequest.model_validate(payload)
+
+
+class FakeStore:
+    def __init__(self):
+        self.dense_called = False
+
+    async def exact_citation_lookup(self, citations, *, filters, limit):
+        return [
+            dict(unit)
+            for citation in citations
+            for unit in _filtered_units(filters)
+            if unit["law_id"] == citation.get("law_id")
+            and unit["article_number"] == citation.get("article_number")
+        ][:limit]
+
+    async def lexical_search(self, question, *, filters, limit):
+        terms = [term for term in question.lower().split() if len(term) >= 3]
+        rows = []
+        for unit in _filtered_units(filters):
+            haystack = f"{unit['raw_text']} {unit['normalized_text']}".lower()
+            matches = sum(1 for term in terms if term in haystack)
+            if matches:
+                rows.append({**unit, "bm25_score": matches / max(1, len(terms))})
+        return sorted(rows, key=lambda row: row["bm25_score"], reverse=True)[:limit]
+
+    async def dense_search(self, query_embedding, *, filters, limit):
+        self.dense_called = True
+        return [
+            {**unit, "dense_score": 0.91 - (index * 0.1)}
+            for index, unit in enumerate(_filtered_units(filters))
+        ][:limit]
+
+
+def _filtered_units(filters):
+    rows = []
+    for unit in _UNITS:
+        if filters.get("legal_domain") and unit["legal_domain"] != filters["legal_domain"]:
+            continue
+        if filters.get("status") == "active" and unit["status"] not in {"active", "unknown"}:
+            continue
+        rows.append(unit)
+    return rows
+
+
+_UNITS = [
+    {
+        "id": "ro.codul_muncii.art_41",
+        "canonical_id": "ro.codul_muncii.art_41",
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "hierarchy_path": ["Codul muncii", "Art. 41"],
+        "article_number": "41",
+        "paragraph_number": None,
+        "letter_number": None,
+        "point_number": None,
+        "raw_text": "Contractul individual de munca poate fi modificat numai prin acordul partilor, prin act aditional.",
+        "normalized_text": "salariu contract munca act aditional acord parti",
+        "legal_domain": "munca",
+        "legal_concepts": ["contract", "salariu"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parent_id": None,
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    },
+    {
+        "id": "ro.codul_muncii.art_160",
+        "canonical_id": "ro.codul_muncii.art_160",
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "hierarchy_path": ["Codul muncii", "Art. 160"],
+        "article_number": "160",
+        "paragraph_number": None,
+        "letter_number": None,
+        "point_number": None,
+        "raw_text": "Salariul cuprinde salariul de baza si alte adaosuri.",
+        "normalized_text": "salariu baza adaosuri",
+        "legal_domain": "munca",
+        "legal_concepts": ["salariu"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parent_id": None,
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    },
+]

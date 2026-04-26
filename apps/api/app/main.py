@@ -11,6 +11,7 @@ from .routes.corpus import router as corpus_router
 from .routes.legal_units import router as legal_units_router
 from .routes.admin import router as admin_router
 from .routes.debug import router as debug_router
+from .routes.retrieve_raw import router as retrieve_raw_router
 from .config import settings
 
 
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(legal_units_router, prefix="/api")
     app.include_router(admin_router, prefix="/api")
     app.include_router(debug_router, prefix="/api")
+    app.include_router(retrieve_raw_router, prefix="/api")
     app.add_api_route(
         "/health",
         health,
