@@ -113,7 +113,15 @@ class ImportRepositoryResult(BaseModel):
     attempted: int = 0
     inserted: int = 0
     updated: int = 0
+    unchanged: int = 0
     skipped: int = 0
+
+
+class ImportRunRepositoryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    import_run_id: str
+    status: str
 
 
 class ImportRepository(Protocol):
@@ -135,10 +143,18 @@ class ImportRepository(Protocol):
     ) -> ImportRepositoryResult:
         ...
 
-    def record_import_run(self, plan: ImportPlan) -> ImportRepositoryResult:
+    def record_import_run(self, plan: ImportPlan) -> ImportRunRepositoryResult:
         ...
 
-    def finalize_import_run(self, plan: ImportPlan) -> ImportRepositoryResult:
+    def finalize_import_run(
+        self,
+        import_run_id: str,
+        *,
+        status: str,
+        counts: Mapping[str, Any],
+        errors: Iterable[Mapping[str, Any]] | None = None,
+        warnings: Iterable[Mapping[str, Any]] | None = None,
+    ) -> ImportRunRepositoryResult:
         ...
 
 
@@ -163,11 +179,19 @@ class NullImportRepository:
     ) -> ImportRepositoryResult:
         return ImportRepositoryResult(attempted=_iter_count(records), skipped=0)
 
-    def record_import_run(self, plan: ImportPlan) -> ImportRepositoryResult:
-        return ImportRepositoryResult(attempted=1, skipped=0)
+    def record_import_run(self, plan: ImportPlan) -> ImportRunRepositoryResult:
+        return ImportRunRepositoryResult(import_run_id=plan.import_run_id, status="dry_run")
 
-    def finalize_import_run(self, plan: ImportPlan) -> ImportRepositoryResult:
-        return ImportRepositoryResult(attempted=1, skipped=0)
+    def finalize_import_run(
+        self,
+        import_run_id: str,
+        *,
+        status: str,
+        counts: Mapping[str, Any],
+        errors: Iterable[Mapping[str, Any]] | None = None,
+        warnings: Iterable[Mapping[str, Any]] | None = None,
+    ) -> ImportRunRepositoryResult:
+        return ImportRunRepositoryResult(import_run_id=import_run_id, status=status)
 
 
 DryRunImportRepository = NullImportRepository
@@ -200,7 +224,7 @@ def build_import_plan(
         with_embeddings=with_embeddings,
         embedding_dim=embedding_dim,
     )
-    safe_for_db_import = validation.passed and mode in {"validate_only", "dry_run"}
+    safe_for_db_import = validation.passed
 
     return ImportPlan(
         import_run_id=import_run_id or f"import_plan_{uuid.uuid4().hex[:12]}",
