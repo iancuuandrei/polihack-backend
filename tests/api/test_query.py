@@ -583,14 +583,15 @@ def test_generation_adapter_scores_focused_contract_modification_over_distractor
     assert distractor.id not in focused_ids
 
 
-def test_handoff04_graph_endpoints_are_not_registered():
+def test_query_graph_endpoint_is_registered_without_explore_endpoints():
     paths = {route.path for route in app.routes}
 
     assert "/api/retrieve/raw" in paths
+    assert "/api/query/{query_id}" in paths
+    assert "/api/query/{query_id}/graph" in paths
     assert "/api/legal-units/{id}/neighbors" not in paths
     assert "/api/explore/root" not in paths
     assert "/api/explore/node/{id}/children" not in paths
-    assert "/api/query/{id}/graph" not in paths
 
 
 def test_post_api_query_rejects_short_question():
