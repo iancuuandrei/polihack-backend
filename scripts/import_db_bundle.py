@@ -17,6 +17,7 @@ from ingestion.imports import build_import_plan
 EXIT_VALID = 0
 EXIT_INVALID_BUNDLE = 1
 EXIT_UNSUPPORTED = 2
+EXIT_INVALID_EMBEDDINGS = 4
 EXIT_DB_ERROR = 5
 PostgresImportRepository = None
 
@@ -36,6 +37,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("--import-run-id", default=None)
     parser.add_argument("--with-embeddings", action="store_true")
+    parser.add_argument("--embedding-dim", type=int, default=2560)
     return parser
 
 
@@ -43,18 +45,6 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
-
-    if args.with_embeddings:
-        return _emit(
-            {
-                "ok": False,
-                "status": "unsupported",
-                "error": "with_embeddings is reserved for H08 Phase D3",
-            },
-            pretty=args.pretty,
-            stream=sys.stderr,
-            exit_code=EXIT_UNSUPPORTED,
-        )
 
     database_url = (args.database_url or os.getenv("DATABASE_URL") or "").strip()
     if args.mode == "apply" and not database_url:
@@ -72,10 +62,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         plan = build_import_plan(
             args.source_dir,
-            with_embeddings=False,
+            with_embeddings=args.with_embeddings,
             mode=args.mode,
+            embedding_dim=args.embedding_dim,
             fail_on_orphan_edges=args.fail_on_orphan_edges,
             import_run_id=args.import_run_id,
+        )
+    except ValueError as exc:
+        return _emit(
+            {
+                "ok": False,
+                "status": "unsupported",
+                "error": str(exc),
+                "duration_seconds": _duration(started),
+            },
+            pretty=args.pretty,
+            stream=sys.stderr,
+            exit_code=EXIT_UNSUPPORTED,
         )
     except Exception:
         return _emit(
@@ -97,9 +100,11 @@ def main(argv: list[str] | None = None) -> int:
                 ok=False,
                 status="invalid_bundle",
                 duration_seconds=_duration(started),
+                with_embeddings=args.with_embeddings,
+                embedding_dim=args.embedding_dim if args.with_embeddings else None,
             ),
             pretty=args.pretty,
-            exit_code=EXIT_INVALID_BUNDLE,
+            exit_code=_invalid_plan_exit_code(args, plan),
         )
 
     if args.mode == "dry_run":
@@ -109,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
                 ok=True,
                 status="dry_run",
                 duration_seconds=_duration(started),
+                with_embeddings=args.with_embeddings,
+                embedding_dim=args.embedding_dim if args.with_embeddings else None,
             ),
             pretty=args.pretty,
             exit_code=EXIT_VALID,
@@ -117,6 +124,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         legal_units = _load_json_array(plan.artifact_paths.legal_units, "legal_units")
         legal_edges = _load_json_array(plan.artifact_paths.legal_edges, "legal_edges")
+        embeddings = (
+            _load_embedding_records(
+                plan.artifact_paths.embeddings_output,
+                plan.artifact_paths.embeddings_input,
+                expected_dim=args.embedding_dim,
+            )
+            if args.with_embeddings
+            else None
+        )
     except ValueError as exc:
         return _emit(
             {
@@ -128,18 +144,27 @@ def main(argv: list[str] | None = None) -> int:
                 "duration_seconds": _duration(started),
             },
             pretty=args.pretty,
-            exit_code=EXIT_INVALID_BUNDLE,
+            exit_code=EXIT_INVALID_EMBEDDINGS if args.with_embeddings else EXIT_INVALID_BUNDLE,
         )
 
     try:
         repository_class = _get_repository_class()
         repository = repository_class(database_url)
         repository.ensure_schema()
-        apply_result = repository.apply_import_plan(
-            plan,
-            legal_units=legal_units,
-            legal_edges=legal_edges,
-        )
+        if args.with_embeddings:
+            apply_result = repository.apply_import_plan(
+                plan,
+                legal_units=legal_units,
+                legal_edges=legal_edges,
+                embeddings=embeddings,
+                expected_embedding_dim=args.embedding_dim,
+            )
+        else:
+            apply_result = repository.apply_import_plan(
+                plan,
+                legal_units=legal_units,
+                legal_edges=legal_edges,
+            )
     except Exception as exc:
         return _emit(
             {
@@ -163,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
             status=apply_result.status,
             duration_seconds=_duration(started),
             apply_counts=apply_result.counts,
+            with_embeddings=args.with_embeddings,
+            embedding_dim=args.embedding_dim if args.with_embeddings else None,
         ),
         pretty=args.pretty,
         exit_code=EXIT_VALID,
@@ -176,6 +203,8 @@ def _summary(
     status: str,
     duration_seconds: float,
     apply_counts: dict[str, Any] | None = None,
+    with_embeddings: bool = False,
+    embedding_dim: int | None = None,
 ) -> dict[str, Any]:
     counts = apply_counts or {
         "legal_units": {
@@ -193,13 +222,16 @@ def _summary(
             "skipped": plan.counts.legal_edges,
         },
         "embeddings": {
-            "attempted": 0,
+            "attempted": plan.counts.embedding_records if with_embeddings else 0,
             "inserted": 0,
             "updated": 0,
             "unchanged": 0,
-            "skipped": 0,
+            "failed": 0,
+            "skipped": plan.counts.embedding_records if with_embeddings else 0,
         },
     }
+    counts = _summary_counts(counts)
+    model_name = _embedding_model_name(plan.artifact_paths.embeddings_manifest) if with_embeddings else None
     return {
         "ok": ok,
         "status": status,
@@ -207,8 +239,14 @@ def _summary(
         "source_dir": plan.source_dir,
         "mode": plan.mode,
         "safe_for_db_import": plan.safe_for_db_import,
-        "table_names": ["legal_units", "legal_edges"],
+        "table_names": (
+            ["legal_units", "legal_edges", "legal_embeddings"]
+            if with_embeddings
+            else ["legal_units", "legal_edges"]
+        ),
         "counts": counts,
+        "embedding_dim": embedding_dim,
+        "model_name": model_name,
         "warnings": [warning.model_dump() for warning in plan.warnings],
         "errors": [error.model_dump() for error in plan.errors],
         "duration_seconds": duration_seconds,
@@ -230,6 +268,140 @@ def _load_json_array(path: str | None, artifact: str) -> list[dict[str, Any]]:
     if len(records) != len(payload):
         raise ValueError(f"{artifact} must contain only JSON objects")
     return records
+
+
+def _load_embedding_records(
+    output_path: str | None,
+    input_path: str | None,
+    *,
+    expected_dim: int,
+) -> list[dict[str, Any]]:
+    from ingestion.embeddings import validate_embedding_vector
+
+    if output_path is None:
+        raise ValueError("missing required artifact: embeddings_output")
+    input_mappings = _load_embedding_input_mappings(input_path)
+    records = _load_jsonl_objects(output_path, "embeddings_output")
+    for index, record in enumerate(records, start=1):
+        record_id = record.get("record_id")
+        metadata = record.get("metadata")
+        if metadata is None:
+            metadata = {}
+            record["metadata"] = metadata
+        if not isinstance(metadata, dict):
+            raise ValueError(f"embeddings_output line {index} metadata must be a JSON object")
+        mapping = input_mappings.get(record_id) if isinstance(record_id, str) else None
+        if not record.get("legal_unit_id") and mapping:
+            record["legal_unit_id"] = mapping.get("legal_unit_id")
+        if not record.get("chunk_id") and mapping:
+            record["chunk_id"] = mapping.get("chunk_id")
+        if not record.get("legal_unit_id"):
+            record["legal_unit_id"] = metadata.get("legal_unit_id")
+        if not record.get("chunk_id"):
+            record["chunk_id"] = metadata.get("chunk_id")
+        if not record.get("legal_unit_id"):
+            raise ValueError(f"embeddings_output line {index} missing legal_unit_id mapping")
+        for field in ("record_id", "model_name", "text_hash"):
+            if not isinstance(record.get(field), str) or not record[field].strip():
+                raise ValueError(f"embeddings_output line {index} missing {field}")
+        embedding_dim = record.get("embedding_dim")
+        if isinstance(embedding_dim, bool) or not isinstance(embedding_dim, int):
+            raise ValueError(f"embeddings_output line {index} missing embedding_dim")
+        if embedding_dim != expected_dim:
+            raise ValueError(
+                f"embeddings_output line {index} dimension mismatch: expected {expected_dim}, got {embedding_dim}"
+            )
+        try:
+            validate_embedding_vector(record.get("embedding"), expected_dim=expected_dim)
+        except ValueError as exc:
+            raise ValueError(f"embeddings_output line {index} invalid embedding vector") from exc
+        record["source_path"] = str(Path(output_path))
+    return records
+
+
+def _load_embedding_input_mappings(input_path: str | None) -> dict[str, dict[str, str | None]]:
+    if input_path is None:
+        return {}
+    mappings: dict[str, dict[str, str | None]] = {}
+    for index, record in enumerate(_load_jsonl_objects(input_path, "embeddings_input"), start=1):
+        record_id = record.get("record_id")
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError(f"embeddings_input line {index} missing record_id")
+        mappings[record_id] = {
+            "legal_unit_id": _optional_string(record.get("legal_unit_id")),
+            "chunk_id": _optional_string(record.get("chunk_id")),
+        }
+    return mappings
+
+
+def _load_jsonl_objects(path: str | Path, artifact: str) -> list[dict[str, Any]]:
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"{artifact} read failed") from exc
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{artifact} line {line_number} is not valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{artifact} line {line_number} must contain a JSON object")
+        records.append(value)
+    return records
+
+
+def _optional_string(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
+def _invalid_plan_exit_code(args: argparse.Namespace, plan) -> int:
+    if args.mode == "apply" and args.with_embeddings and _has_embedding_errors(plan):
+        return EXIT_INVALID_EMBEDDINGS
+    return EXIT_INVALID_BUNDLE
+
+
+def _has_embedding_errors(plan) -> bool:
+    return any(
+        error.code.startswith("embedding")
+        or error.code.startswith("embeddings")
+        or error.code == "missing_required_embedding_artifact"
+        or error.artifact in {"embeddings_input", "embeddings_output", "embeddings_manifest"}
+        for error in plan.errors
+    )
+
+
+def _summary_counts(counts: dict[str, Any]) -> dict[str, Any]:
+    return {name: _count_payload(values) for name, values in counts.items()}
+
+
+def _count_payload(values: Any) -> dict[str, int]:
+    payload = dict(values)
+    for field in ("attempted", "inserted", "updated", "unchanged", "failed", "skipped"):
+        payload.setdefault(field, 0)
+    payload["attempted_count"] = payload["attempted"]
+    payload["inserted_count"] = payload["inserted"]
+    payload["updated_count"] = payload["updated"]
+    payload["unchanged_count"] = payload["unchanged"]
+    payload["failed_count"] = payload["failed"]
+    return payload
+
+
+def _embedding_model_name(path: str | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model_name = payload.get("model_name")
+    return model_name if isinstance(model_name, str) and model_name.strip() else None
 
 
 def _duration(started: float) -> float:

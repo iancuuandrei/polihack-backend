@@ -114,7 +114,28 @@ class ImportRepositoryResult(BaseModel):
     inserted: int = 0
     updated: int = 0
     unchanged: int = 0
+    failed: int = 0
     skipped: int = 0
+
+    @property
+    def attempted_count(self) -> int:
+        return self.attempted
+
+    @property
+    def inserted_count(self) -> int:
+        return self.inserted
+
+    @property
+    def updated_count(self) -> int:
+        return self.updated
+
+    @property
+    def unchanged_count(self) -> int:
+        return self.unchanged
+
+    @property
+    def failed_count(self) -> int:
+        return self.failed
 
 
 class ImportRunRepositoryResult(BaseModel):
@@ -140,6 +161,8 @@ class ImportRepository(Protocol):
     def upsert_embeddings(
         self,
         records: Iterable[Mapping[str, Any]],
+        *,
+        expected_dim: int = DEFAULT_EMBEDDING_DIM,
     ) -> ImportRepositoryResult:
         ...
 
@@ -176,6 +199,8 @@ class NullImportRepository:
     def upsert_embeddings(
         self,
         records: Iterable[Mapping[str, Any]],
+        *,
+        expected_dim: int = DEFAULT_EMBEDDING_DIM,
     ) -> ImportRepositoryResult:
         return ImportRepositoryResult(attempted=_iter_count(records), skipped=0)
 

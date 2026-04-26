@@ -12,14 +12,16 @@ from typing import Any
 import asyncpg
 from pydantic import BaseModel, ConfigDict, Field
 
+from ingestion.embeddings import validate_embedding_vector
 from ingestion.imports import (
+    DEFAULT_EMBEDDING_DIM,
     ImportPlan,
     ImportRepositoryResult,
     ImportRunRepositoryResult,
 )
 
 
-MIGRATION_PATH = (
+MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[1]
     / "apps"
     / "api"
@@ -37,19 +39,14 @@ class ImportBundleApplyResult(BaseModel):
     status: str
     legal_units: ImportRepositoryResult = Field(default_factory=ImportRepositoryResult)
     legal_edges: ImportRepositoryResult = Field(default_factory=ImportRepositoryResult)
+    embeddings: ImportRepositoryResult = Field(default_factory=ImportRepositoryResult)
 
     @property
     def counts(self) -> dict[str, Any]:
         return {
             "legal_units": self.legal_units.model_dump(),
             "legal_edges": self.legal_edges.model_dump(),
-            "embeddings": {
-                "attempted": 0,
-                "inserted": 0,
-                "updated": 0,
-                "unchanged": 0,
-                "skipped": 0,
-            },
+            "embeddings": self.embeddings.model_dump(),
         }
 
 
@@ -122,8 +119,28 @@ class PostgresImportRepository:
     def upsert_embeddings(
         self,
         records: Iterable[Mapping[str, Any]],
+        *,
+        expected_dim: int = DEFAULT_EMBEDDING_DIM,
     ) -> ImportRepositoryResult:
-        raise NotImplementedError("embedding import is reserved for H08 Phase D3")
+        return _run_sync(self.aupsert_embeddings(records, expected_dim=expected_dim))
+
+    async def aupsert_embeddings(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        expected_dim: int = DEFAULT_EMBEDDING_DIM,
+        connection: Any | None = None,
+    ) -> ImportRepositoryResult:
+        prepared_records = [
+            _embedding_params(record, expected_dim=expected_dim) for record in records
+        ]
+        if not prepared_records:
+            return ImportRepositoryResult()
+        if connection is not None:
+            return await self._upsert_embeddings(connection, prepared_records)
+        async with self._managed_connection() as managed_connection:
+            async with managed_connection.transaction():
+                return await self._upsert_embeddings(managed_connection, prepared_records)
 
     def record_import_run(self, plan: ImportPlan) -> ImportRunRepositoryResult:
         return _run_sync(self.arecord_import_run(plan))
@@ -195,12 +212,16 @@ class PostgresImportRepository:
         *,
         legal_units: Iterable[Mapping[str, Any]],
         legal_edges: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Mapping[str, Any]] | None = None,
+        expected_embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     ) -> ImportBundleApplyResult:
         return _run_sync(
             self.aapply_import_plan(
                 plan,
                 legal_units=legal_units,
                 legal_edges=legal_edges,
+                embeddings=embeddings,
+                expected_embedding_dim=expected_embedding_dim,
             )
         )
 
@@ -210,9 +231,12 @@ class PostgresImportRepository:
         *,
         legal_units: Iterable[Mapping[str, Any]],
         legal_edges: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Mapping[str, Any]] | None = None,
+        expected_embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     ) -> ImportBundleApplyResult:
         unit_records = list(legal_units)
         edge_records = list(legal_edges)
+        embedding_records = list(embeddings or [])
         async with self._managed_connection() as connection:
             async with connection.transaction():
                 await self._record_import_run(connection, plan)
@@ -224,11 +248,17 @@ class PostgresImportRepository:
                     edge_records,
                     connection=connection,
                 )
+                embeddings_result = await self.aupsert_embeddings(
+                    embedding_records,
+                    expected_dim=expected_embedding_dim,
+                    connection=connection,
+                )
                 apply_result = ImportBundleApplyResult(
                     import_run_id=plan.import_run_id,
                     status="succeeded",
                     legal_units=units_result,
                     legal_edges=edges_result,
+                    embeddings=embeddings_result,
                 )
                 await self._finalize_import_run(
                     connection,
@@ -283,6 +313,29 @@ class PostgresImportRepository:
         unchanged = 0
         for params in records:
             row = await connection.fetchrow(_UPSERT_LEGAL_EDGE_SQL, *params)
+            if row is None:
+                unchanged += 1
+            elif bool(row["inserted"]):
+                inserted += 1
+            else:
+                updated += 1
+        return ImportRepositoryResult(
+            attempted=len(records),
+            inserted=inserted,
+            updated=updated,
+            unchanged=unchanged,
+        )
+
+    async def _upsert_embeddings(
+        self,
+        connection: Any,
+        records: list[tuple[Any, ...]],
+    ) -> ImportRepositoryResult:
+        inserted = 0
+        updated = 0
+        unchanged = 0
+        for params in records:
+            row = await connection.fetchrow(_UPSERT_EMBEDDING_SQL, *params)
             if row is None:
                 unchanged += 1
             elif bool(row["inserted"]):
@@ -355,8 +408,13 @@ def _to_asyncpg_url(database_url: str) -> str:
 
 
 def _migration_statements() -> list[str]:
-    sql = MIGRATION_PATH.read_text(encoding="utf-8")
-    return [statement.strip() for statement in sql.split(";") if statement.strip()]
+    statements: list[str] = []
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        sql = path.read_text(encoding="utf-8")
+        statements.extend(
+            statement.strip() for statement in sql.split(";") if statement.strip()
+        )
+    return statements
 
 
 def _legal_unit_params(record: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -402,11 +460,57 @@ def _legal_edge_params(record: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _embedding_params(
+    record: Mapping[str, Any] | BaseModel,
+    *,
+    expected_dim: int,
+) -> tuple[Any, ...]:
+    if expected_dim <= 0:
+        raise ValueError("expected_dim must be greater than 0")
+    data = _record_mapping(record)
+    metadata = data.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise ValueError("embeddings record metadata must be a JSON object")
+
+    embedding_dim = data.get("embedding_dim")
+    if isinstance(embedding_dim, bool) or not isinstance(embedding_dim, int):
+        raise ValueError("embeddings record missing valid embedding_dim")
+    if embedding_dim != expected_dim:
+        raise ValueError(
+            f"embeddings record dimension mismatch: expected {expected_dim}, got {embedding_dim}"
+        )
+
+    vector = validate_embedding_vector(data.get("embedding"), expected_dim=expected_dim)
+    legal_unit_id = _text(data.get("legal_unit_id")) or _text(metadata.get("legal_unit_id"))
+    if not legal_unit_id:
+        raise ValueError("embeddings record missing legal_unit_id mapping")
+
+    return (
+        _required_text(data, "record_id", artifact="embeddings"),
+        legal_unit_id,
+        _text(data.get("chunk_id")) or _text(metadata.get("chunk_id")),
+        _required_text(data, "model_name", artifact="embeddings"),
+        embedding_dim,
+        _required_text(data, "text_hash", artifact="embeddings"),
+        _vector_param(vector),
+        _json_param(metadata),
+        _text(data.get("source_path")),
+    )
+
+
 def _required_text(record: Mapping[str, Any], field: str, *, artifact: str) -> str:
     value = _text(record.get(field))
     if not value:
         raise ValueError(f"{artifact} record missing required field: {field}")
     return value
+
+
+def _record_mapping(record: Mapping[str, Any] | BaseModel) -> dict[str, Any]:
+    if isinstance(record, BaseModel):
+        return record.model_dump()
+    return dict(record)
 
 
 def _text(value: Any) -> str | None:
@@ -441,6 +545,10 @@ def _json_param(value: Any) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _vector_param(vector: list[float]) -> str:
+    return "[" + ",".join(repr(float(value)) for value in vector) + "]"
 
 
 _UPSERT_LEGAL_UNIT_SQL = """
@@ -590,6 +698,49 @@ WHERE (
     EXCLUDED.weight,
     EXCLUDED.confidence,
     EXCLUDED.metadata
+)
+RETURNING (xmax = 0) AS inserted
+"""
+
+
+_UPSERT_EMBEDDING_SQL = """
+INSERT INTO legal_embeddings (
+    record_id,
+    legal_unit_id,
+    chunk_id,
+    model_name,
+    embedding_dim,
+    text_hash,
+    embedding,
+    metadata,
+    source_path,
+    created_at,
+    updated_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7::vector, $8::jsonb, $9, now(), now()
+)
+ON CONFLICT (record_id, model_name, text_hash) DO UPDATE SET
+    legal_unit_id = EXCLUDED.legal_unit_id,
+    chunk_id = EXCLUDED.chunk_id,
+    embedding_dim = EXCLUDED.embedding_dim,
+    embedding = EXCLUDED.embedding,
+    metadata = EXCLUDED.metadata,
+    source_path = EXCLUDED.source_path,
+    updated_at = now()
+WHERE (
+    legal_embeddings.legal_unit_id,
+    legal_embeddings.chunk_id,
+    legal_embeddings.embedding_dim,
+    legal_embeddings.embedding::text,
+    legal_embeddings.metadata,
+    legal_embeddings.source_path
+) IS DISTINCT FROM (
+    EXCLUDED.legal_unit_id,
+    EXCLUDED.chunk_id,
+    EXCLUDED.embedding_dim,
+    EXCLUDED.embedding::text,
+    EXCLUDED.metadata,
+    EXCLUDED.source_path
 )
 RETURNING (xmax = 0) AS inserted
 """

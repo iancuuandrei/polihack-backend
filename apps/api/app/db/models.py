@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Date, DateTime, Float, JSON, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, Float, Index, Integer, JSON, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:  # pragma: no cover - production env includes pgvector
+    Vector = None
 
 
 class Base(DeclarativeBase):
@@ -90,4 +95,43 @@ class ImportRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+
+class LegalEmbedding(Base):
+    __tablename__ = "legal_embeddings"
+    __table_args__ = (
+        UniqueConstraint(
+            "record_id",
+            "model_name",
+            "text_hash",
+            name="legal_embeddings_identity_unique",
+        ),
+        Index("idx_embeddings_record_id", "record_id"),
+        Index("idx_embeddings_legal_unit_id", "legal_unit_id"),
+        Index("idx_embeddings_model_name", "model_name"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    record_id: Mapped[str] = mapped_column(Text, nullable=False)
+    legal_unit_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chunk_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_name: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    text_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Any] = mapped_column(
+        Vector(2560) if Vector is not None else Text,
+        nullable=False,
+    )
+    metadata_: Mapped[Any | None] = mapped_column("metadata", JSON, nullable=True)
+    source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )
