@@ -48,3 +48,6 @@ Thumbs.db
 !tests/fixtures/**/*.jsonl
 *.pkl
 .env
+
+# Claude prefix
+Claude.md

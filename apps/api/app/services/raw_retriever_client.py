@@ -34,12 +34,14 @@ class RawRetrieverClient:
         plan: QueryPlan,
         *,
         query_frame: QueryFrame | None = None,
+        query_embedding: list[float] | None = None,
         top_k: int = 50,
         debug: bool = False,
     ) -> RawRetrievalResponse:
         request = self.build_request(
             plan=plan,
             query_frame=query_frame,
+            query_embedding=query_embedding,
             top_k=top_k,
             debug=debug,
         )
@@ -88,6 +90,7 @@ class RawRetrieverClient:
         plan: QueryPlan,
         *,
         query_frame: QueryFrame | None = None,
+        query_embedding: list[float] | None = None,
         top_k: int = 50,
         debug: bool = False,
     ) -> RawRetrievalRequest:
@@ -101,6 +104,7 @@ class RawRetrieverClient:
             exact_citations=[
                 citation.model_dump(mode="json") for citation in plan.exact_citations
             ],
+            query_embedding=query_embedding,
             top_k=top_k,
             debug=debug,
         )
@@ -203,7 +207,7 @@ class RawRetrieverClient:
     ) -> dict[str, Any]:
         debug_payload: dict[str, Any] = {
             "backend": backend,
-            "request_payload": request_payload,
+            "request_payload": self._safe_debug_request_payload(request_payload),
             "response_summary": {
                 "candidate_count": len(response.candidates),
                 "retrieval_methods": response.retrieval_methods,
@@ -216,3 +220,21 @@ class RawRetrieverClient:
         if raw_retriever_debug is not None:
             debug_payload["raw_retriever_debug"] = raw_retriever_debug
         return debug_payload
+
+    def _safe_debug_request_payload(
+        self,
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(request_payload)
+        embedding = payload.get("query_embedding")
+        if isinstance(embedding, list) and embedding:
+            payload["query_embedding"] = {
+                "present": True,
+                "dimension": len(embedding),
+            }
+        else:
+            payload["query_embedding"] = {
+                "present": False,
+                "dimension": None,
+            }
+        return payload

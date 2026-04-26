@@ -80,6 +80,29 @@ async def test_request_payload_includes_query_frame_when_provided():
 
 
 @pytest.mark.anyio
+async def test_build_request_accepts_query_embedding_and_debug_masks_vector():
+    plan = build_plan("Poate angajatorul sa-mi scada salariul fara act aditional?")
+    client = RawRetrieverClient(base_url=None, use_internal=False)
+    request = client.build_request(
+        plan,
+        query_embedding=[0.1, 0.2],
+        debug=True,
+    )
+
+    assert request.query_embedding == [0.1, 0.2]
+
+    response = await client.retrieve(
+        plan,
+        query_embedding=[0.1, 0.2],
+        debug=True,
+    )
+
+    payload = response.debug["request_payload"]
+    assert payload["query_embedding"] == {"present": True, "dimension": 2}
+    assert "[0.1, 0.2]" not in str(response.debug)
+
+
+@pytest.mark.anyio
 async def test_exact_citation_payload_includes_phase3_filters():
     plan = build_plan("Ce spune art. 41 alin. (1) din Codul muncii?")
     response = await RawRetrieverClient(base_url=None, use_internal=False).retrieve(

@@ -1,6 +1,7 @@
 import inspect
 from uuid import NAMESPACE_URL, uuid5
 
+from ..config import settings
 from ..schemas import (
     AnswerPayload,
     Citation,
@@ -25,9 +26,16 @@ from .generation_adapter import (
 )
 from .graph_expansion_policy import GraphExpansionPolicy
 from .legal_ranker import LegalRanker
+from .llm_query_decomposer import LLMQueryDecomposer, merge_query_frames
 from .mock_evidence import MockEvidenceService
 from .query_frame import QueryFrameBuilder
 from .query_graph_enricher import QueryGraphEnricher
+from .query_embedding_service import (
+    QUERY_EMBEDDING_UNAVAILABLE,
+    QueryEmbeddingResult,
+    QueryEmbeddingService,
+)
+from .requirement_backfill import RequirementBackfillService
 from .query_understanding import QueryUnderstanding
 from .raw_retriever_client import RAW_RETRIEVAL_NOT_CONFIGURED, RawRetrieverClient
 
@@ -46,6 +54,9 @@ class QueryOrchestrator:
         answer_repair: AnswerRepair | None = None,
         query_frame_builder: QueryFrameBuilder | None = None,
         query_graph_enricher: QueryGraphEnricher | None = None,
+        query_decomposer: LLMQueryDecomposer | None = None,
+        query_embedding_service: QueryEmbeddingService | None = None,
+        requirement_backfill_service: RequirementBackfillService | None = None,
     ) -> None:
         self.evidence_service = evidence_service or MockEvidenceService()
         self.query_understanding = query_understanding or QueryUnderstanding()
@@ -62,17 +73,36 @@ class QueryOrchestrator:
         self.answer_repair = answer_repair or AnswerRepair()
         self.query_frame_builder = query_frame_builder or QueryFrameBuilder()
         self.query_graph_enricher = query_graph_enricher or QueryGraphEnricher()
+        self.query_decomposer = query_decomposer or LLMQueryDecomposer()
+        self.query_embedding_service = (
+            query_embedding_service or QueryEmbeddingService()
+        )
+        self.requirement_backfill_service = (
+            requirement_backfill_service
+            or RequirementBackfillService(
+                evidence_pack_compiler=self.evidence_pack_compiler
+            )
+        )
 
     async def run(self, request: QueryRequest) -> QueryResponse:
         query_id = self._query_id(request)
         query_plan = self.query_understanding.build_plan(request)
-        query_frame = self.query_frame_builder.build(
+        deterministic_query_frame = self.query_frame_builder.build(
             question=request.question,
             plan=query_plan,
+        )
+        query_frame, query_decomposer_debug = await self._query_frame_with_optional_llm(
+            question=request.question,
+            deterministic_query_frame=deterministic_query_frame,
+        )
+        query_embedding = await self._query_embedding(
+            question=request.question,
+            debug=request.debug,
         )
         raw_retrieval = await self._retrieve_raw(
             query_plan=query_plan,
             query_frame=query_frame,
+            query_embedding=query_embedding.embedding,
             debug=request.debug,
         )
         graph_expansion = await self.graph_expansion_policy.expand(
@@ -93,8 +123,17 @@ class QueryOrchestrator:
             graph_expansion=graph_expansion,
             plan=query_plan,
             query_frame=query_frame,
+            debug=True,
+        )
+        backfill = await self.requirement_backfill_service.backfill(
+            plan=query_plan,
+            query_frame=query_frame,
+            ranked_candidates=legal_ranker.ranked_candidates,
+            evidence_result=compiled_evidence,
+            graph_expansion=graph_expansion,
             debug=request.debug,
         )
+        compiled_evidence = backfill.evidence_result
         draft_answer = self._generate_answer(
             question=request.question,
             evidence_units=compiled_evidence.evidence_units,
@@ -121,9 +160,11 @@ class QueryOrchestrator:
             verification.verified_citation_ids,
         )
         pre_repair_warnings = self._dedupe(
-            raw_retrieval.warnings
+            query_embedding.warnings
+            + raw_retrieval.warnings
             + graph_expansion.warnings
             + legal_ranker.warnings
+            + backfill.warnings
             + compiled_evidence.warnings
             + self._generation_warnings(draft_answer, verifier_ran=True)
             + verification.warnings
@@ -161,10 +202,13 @@ class QueryOrchestrator:
                 retrieval_mode=self._retrieval_mode(raw_retrieval),
                 query_understanding=query_plan,
                 query_frame=query_frame.model_dump(mode="json"),
+                query_decomposer=query_decomposer_debug,
+                query_embedding=self._query_embedding_debug(query_embedding),
                 retrieval=raw_retrieval.debug,
                 graph_expansion=graph_expansion.debug,
                 legal_ranker=legal_ranker.debug,
                 evidence_pack=compiled_evidence.debug,
+                requirement_backfill=backfill.debug,
                 generation=self._generation_debug(draft_answer, verifier_ran=True),
                 verifier=verification.debug,
                 answer_repair=repair.debug,
@@ -173,6 +217,7 @@ class QueryOrchestrator:
                 graph_nodes_count=len(graph.nodes),
                 graph_edges_count=len(graph.edges),
                 notes=[
+                    "RequirementBackfillService runs after EvidencePackCompiler and before GenerationAdapter.",
                     "GenerationAdapter, CitationVerifier V1, and AnswerRepair V1 ran over compiled EvidencePack.",
                 ],
             )
@@ -366,17 +411,173 @@ class QueryOrchestrator:
             return "fallback_unconfigured"
         return f"raw_retriever_client:{self.raw_retriever_client.__class__.__name__}"
 
-    async def _retrieve_raw(self, *, query_plan, query_frame, debug: bool):
+    async def _retrieve_raw(
+        self,
+        *,
+        query_plan,
+        query_frame,
+        query_embedding: list[float] | None,
+        debug: bool,
+    ):
         retrieve = self.raw_retriever_client.retrieve
         parameters = inspect.signature(retrieve).parameters
-        if "query_frame" in parameters:
-            return await retrieve(
-                query_plan,
-                query_frame=query_frame,
-                top_k=50,
-                debug=debug,
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs = {"top_k": 50, "debug": debug}
+        if accepts_kwargs or "query_frame" in parameters:
+            kwargs["query_frame"] = query_frame
+        if accepts_kwargs or "query_embedding" in parameters:
+            kwargs["query_embedding"] = query_embedding
+        return await retrieve(query_plan, **kwargs)
+
+    async def _query_embedding(
+        self,
+        *,
+        question: str,
+        debug: bool,
+    ) -> QueryEmbeddingResult:
+        try:
+            embed = self.query_embedding_service.embed
+            parameters = inspect.signature(embed).parameters
+            if "debug" in parameters:
+                result = embed(question, debug=debug)
+            else:
+                result = embed(question)
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, QueryEmbeddingResult):
+                return result
+        except Exception as exc:
+            return QueryEmbeddingResult(
+                enabled=True,
+                available=False,
+                warnings=[QUERY_EMBEDDING_UNAVAILABLE],
+                debug={
+                    "enabled": True,
+                    "attempted": True,
+                    "available": False,
+                    "model": getattr(self.query_embedding_service, "model", None),
+                    "dimension": None,
+                    "fallback_reason": f"exception:{type(exc).__name__}",
+                    "latency_ms": None,
+                }
+                if debug
+                else None,
             )
-        return await retrieve(query_plan, top_k=50, debug=debug)
+        return QueryEmbeddingResult(
+            enabled=True,
+            available=False,
+            warnings=[QUERY_EMBEDDING_UNAVAILABLE],
+            debug={
+                "enabled": True,
+                "attempted": True,
+                "available": False,
+                "model": getattr(self.query_embedding_service, "model", None),
+                "dimension": None,
+                "fallback_reason": "invalid_result",
+                "latency_ms": None,
+            }
+            if debug
+            else None,
+        )
+
+    def _query_embedding_debug(
+        self,
+        result: QueryEmbeddingResult,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "enabled": result.enabled,
+            "available": result.available,
+            "model": result.model,
+            "dimension": result.dimension,
+            "warnings": result.warnings,
+        }
+        if result.debug:
+            for key in ("attempted", "fallback_reason", "latency_ms"):
+                if key in result.debug:
+                    payload[key] = result.debug[key]
+        return payload
+
+    async def _query_frame_with_optional_llm(
+        self,
+        *,
+        question: str,
+        deterministic_query_frame,
+    ):
+        if not settings.enable_llm_query_decomposer:
+            return deterministic_query_frame, self._query_decomposer_debug(
+                enabled=False,
+                attempted=False,
+                succeeded=False,
+            )
+        if not getattr(self.query_decomposer, "enabled", False):
+            return deterministic_query_frame, self._query_decomposer_debug(
+                enabled=False,
+                attempted=False,
+                succeeded=False,
+            )
+
+        registry = self.query_frame_builder.registry
+        known_intents = [intent.id for intent in registry.all()]
+        allowed_domains = sorted(
+            {intent.domain for intent in registry.all() if intent.domain}
+        )
+        try:
+            result = await self.query_decomposer.decompose(
+                question=question,
+                deterministic_query_frame=deterministic_query_frame,
+                known_intents=known_intents,
+                allowed_domains=allowed_domains,
+            )
+        except Exception as exc:
+            return deterministic_query_frame, self._query_decomposer_debug(
+                enabled=True,
+                attempted=True,
+                succeeded=False,
+                fallback_reason=f"exception:{type(exc).__name__}",
+                model=getattr(self.query_decomposer, "model", None),
+            )
+
+        debug = getattr(result, "debug", None) or self._query_decomposer_debug(
+            enabled=True,
+            attempted=True,
+            succeeded=False,
+            fallback_reason="empty_result",
+            model=getattr(self.query_decomposer, "model", None),
+        )
+        decomposition = getattr(result, "decomposition", None)
+        if decomposition is None or not debug.get("succeeded"):
+            return deterministic_query_frame, debug
+
+        return (
+            merge_query_frames(
+                deterministic_query_frame,
+                decomposition,
+                registry=registry,
+            ),
+            debug,
+        )
+
+    def _query_decomposer_debug(
+        self,
+        *,
+        enabled: bool,
+        attempted: bool,
+        succeeded: bool,
+        fallback_reason: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "enabled": enabled,
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "fallback_reason": fallback_reason,
+            "forbidden_keys_detected": [],
+            "latency_ms": None,
+            "model": model,
+        }
 
     def _query_id(self, request: QueryRequest) -> str:
         stable_input = "|".join(
