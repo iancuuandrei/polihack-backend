@@ -1504,6 +1504,103 @@ def _debug_group_scores(
     return scores
 
 
+def build_registry_lexical_query(
+    question: str,
+    filters: Mapping[str, Any] | None = None,
+    *,
+    query_frame: Mapping[str, Any] | None = None,
+) -> _LexicalQuery:
+    return _build_lexical_query(
+        question,
+        filters or {},
+        query_frame=query_frame,
+    )
+
+
+def score_unit_for_fallback(
+    unit: Mapping[str, Any],
+    lexical_query: _LexicalQuery,
+) -> dict[str, Any]:
+    weighted_terms = _weighted_fallback_terms(
+        _fallback_search_terms(
+            lexical_query.expanded_terms,
+            lexical_query.fallback_intent,
+        )
+    )
+    haystack = _normalize_text(
+        f"{unit.get('raw_text') or ''} {unit.get('normalized_text') or ''}"
+    )
+    if lexical_query.fallback_intent:
+        group_scores = _intent_group_scores_for_text(
+            haystack,
+            weighted_terms,
+            lexical_query.fallback_intent,
+        )
+        fallback_score = _intent_final_score_for_groups(group_scores)
+    else:
+        group_scores = {
+            "core_score": 0.0,
+            "target_score": 0.0,
+            "actor_score": 0.0,
+            "qualifier_score": 0.0,
+            "generic_score": 0.0,
+            "distractor_score": 0.0,
+        }
+        fallback_score = _lexical_ilike_score_for_text(haystack, weighted_terms)
+    return {
+        "unit_id": str(unit.get("id") or ""),
+        "fallback_score": round(_clamp01(fallback_score), 6),
+        "group_scores": {
+            name: round(value, 6) for name, value in group_scores.items()
+        },
+    }
+
+
+def evaluate_fallback_candidates(
+    *,
+    question: str,
+    filters: Mapping[str, Any] | None = None,
+    query_frame: Mapping[str, Any] | None = None,
+    candidate_units: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    lexical_query = build_registry_lexical_query(
+        question,
+        filters or {},
+        query_frame=query_frame,
+    )
+    ranked = []
+    for unit in candidate_units:
+        score_row = score_unit_for_fallback(unit, lexical_query)
+        if score_row["fallback_score"] <= 0.0:
+            continue
+        ranked.append(
+            {
+                **score_row,
+                "unit": dict(unit),
+            }
+        )
+    ranked.sort(
+        key=lambda row: (
+            -row["fallback_score"],
+            -row["group_scores"].get("core_score", 0.0),
+            row["unit_id"],
+        ),
+    )
+    for index, row in enumerate(ranked, start=1):
+        row["rank"] = index
+    debug_payload = _lexical_debug_payload(lexical_query, fallback_used=True)
+    return {
+        "lexical_query": lexical_query,
+        "lexical_terms": debug_payload["lexical_terms"],
+        "expanded_terms": debug_payload["expanded_terms"],
+        "registry_expanded_terms": debug_payload["registry_expanded_terms"],
+        "fallback_intent": debug_payload["fallback_intent"],
+        "fallback_intent_source": debug_payload["fallback_intent_source"],
+        "scoring_strategy": debug_payload["scoring_strategy"],
+        "ranked": ranked,
+    }
+
+
 def _query_frame_list(
     query_frame: Mapping[str, Any] | None,
     field_name: str,
