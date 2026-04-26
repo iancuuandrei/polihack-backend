@@ -3,6 +3,7 @@ import pytest
 from apps.api.app.schemas import QueryRequest, RawRetrievalResponse, RetrievalCandidate
 from apps.api.app.services.graph_expansion_policy import (
     EDGE_TYPE_WEIGHTS,
+    GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE,
     GRAPH_EXPANSION_NO_SEED_CANDIDATES,
     GRAPH_EXPANSION_NOT_CONFIGURED,
     GraphExpansionPolicy,
@@ -35,7 +36,10 @@ async def test_no_seed_candidates_returns_safe_noop_fallback():
     assert result.expanded_candidates == []
     assert result.graph_nodes == []
     assert result.graph_edges == []
-    assert result.warnings == [GRAPH_EXPANSION_NO_SEED_CANDIDATES]
+    assert result.warnings == [
+        GRAPH_EXPANSION_NO_SEED_CANDIDATES,
+        GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE,
+    ]
     assert result.debug["fallback_used"] is True
     assert result.debug["reason"] == "graph expansion has no seed candidates"
     assert result.debug["seed_candidate_count"] == 0
@@ -64,7 +68,10 @@ async def test_seed_candidate_without_neighbors_client_returns_seed_only_fallbac
         debug=True,
     )
 
-    assert result.warnings == [GRAPH_EXPANSION_NOT_CONFIGURED]
+    assert result.warnings == [
+        GRAPH_EXPANSION_NOT_CONFIGURED,
+        GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE,
+    ]
     assert len(result.seed_candidates) == 1
     assert len(result.expanded_candidates) == 1
     expanded = result.expanded_candidates[0]

@@ -1,3 +1,5 @@
+from collections.abc import Callable
+import inspect
 from typing import Any
 
 import httpx
@@ -14,12 +16,17 @@ class RawRetrieverClient:
         self,
         base_url: str | None = None,
         timeout_seconds: float = 5.0,
+        *,
+        use_internal: bool | None = None,
+        internal_retriever_factory: Callable[[], Any] | None = None,
     ) -> None:
         configured_url = base_url
         if configured_url is None:
             configured_url = settings.raw_retrieval_base_url
         self.base_url = configured_url.strip().rstrip("/") if configured_url else None
         self.timeout_seconds = timeout_seconds
+        self.use_internal = (self.base_url is None) if use_internal is None else use_internal
+        self.internal_retriever_factory = internal_retriever_factory
 
     async def retrieve(
         self,
@@ -30,6 +37,13 @@ class RawRetrieverClient:
     ) -> RawRetrievalResponse:
         request = self.build_request(plan=plan, top_k=top_k, debug=debug)
         request_payload = request.model_dump(mode="json")
+
+        if self.use_internal:
+            return await self._retrieve_internal(
+                request=request,
+                request_payload=request_payload,
+                debug=debug,
+            )
 
         if not self.base_url:
             return self._fallback_response(
@@ -51,11 +65,14 @@ class RawRetrieverClient:
             )
 
         if debug:
+            raw_debug = response.debug
             response.debug = self._debug_payload(
                 request_payload=request_payload,
                 response=response,
                 fallback_used=False,
                 reason=None,
+                backend="http",
+                raw_retriever_debug=raw_debug,
             )
         return response
 
@@ -68,6 +85,7 @@ class RawRetrieverClient:
     ) -> RawRetrievalRequest:
         return RawRetrievalRequest(
             question=plan.question,
+            filters=plan.retrieval_filters,
             retrieval_filters=plan.retrieval_filters,
             exact_citations=[
                 citation.model_dump(mode="json") for citation in plan.exact_citations
@@ -75,6 +93,53 @@ class RawRetrieverClient:
             top_k=top_k,
             debug=debug,
         )
+
+    async def _retrieve_internal(
+        self,
+        *,
+        request: RawRetrievalRequest,
+        request_payload: dict[str, Any],
+        debug: bool,
+    ) -> RawRetrievalResponse:
+        try:
+            response = await self._call_internal_retriever(request)
+        except Exception:
+            return self._fallback_response(
+                warning=RAW_RETRIEVAL_UNAVAILABLE,
+                reason="internal raw retrieval failed",
+                request_payload=request_payload,
+                debug=debug,
+                backend="internal",
+            )
+
+        if debug:
+            raw_debug = response.debug
+            response.debug = self._debug_payload(
+                request_payload=request_payload,
+                response=response,
+                fallback_used=False,
+                reason=None,
+                backend="internal",
+                raw_retriever_debug=raw_debug,
+            )
+        return response
+
+    async def _call_internal_retriever(
+        self,
+        request: RawRetrievalRequest,
+    ) -> RawRetrievalResponse:
+        if self.internal_retriever_factory is not None:
+            retriever = self.internal_retriever_factory()
+            if inspect.isawaitable(retriever):
+                retriever = await retriever
+            return await retriever.retrieve(request)
+
+        from ..db.session import session_context
+        from .raw_retriever import PostgresRawRetrievalStore, RawRetriever
+
+        async with session_context() as session:
+            retriever = RawRetriever(PostgresRawRetrievalStore(session))
+            return await retriever.retrieve(request)
 
     async def _send_payload(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
@@ -96,6 +161,7 @@ class RawRetrieverClient:
         reason: str,
         request_payload: dict[str, Any],
         debug: bool,
+        backend: str = "http",
     ) -> RawRetrievalResponse:
         response = RawRetrievalResponse(
             candidates=[],
@@ -109,6 +175,8 @@ class RawRetrieverClient:
                 response=response,
                 fallback_used=True,
                 reason=reason,
+                backend=backend,
+                raw_retriever_debug=None,
             )
         return response
 
@@ -119,8 +187,11 @@ class RawRetrieverClient:
         response: RawRetrievalResponse,
         fallback_used: bool,
         reason: str | None,
+        backend: str,
+        raw_retriever_debug: dict[str, Any] | None,
     ) -> dict[str, Any]:
         debug_payload: dict[str, Any] = {
+            "backend": backend,
             "request_payload": request_payload,
             "response_summary": {
                 "candidate_count": len(response.candidates),
@@ -131,4 +202,6 @@ class RawRetrieverClient:
         }
         if reason:
             debug_payload["reason"] = reason
+        if raw_retriever_debug is not None:
+            debug_payload["raw_retriever_debug"] = raw_retriever_debug
         return debug_payload

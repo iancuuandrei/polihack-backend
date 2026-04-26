@@ -16,6 +16,7 @@ from ..schemas import (
 GRAPH_EXPANSION_NO_SEED_CANDIDATES = "graph_expansion_no_seed_candidates"
 GRAPH_EXPANSION_NOT_CONFIGURED = "graph_expansion_not_configured"
 GRAPH_EXPANSION_NEIGHBORS_UNAVAILABLE = "graph_expansion_neighbors_unavailable"
+GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE = "graph_expansion_empty_or_unavailable"
 
 DEFAULT_ALLOWED_EDGE_TYPES = [
     "contains_parent",
@@ -76,7 +77,10 @@ class GraphExpansionPolicy:
                 seed_candidates=[],
                 expanded_candidates=[],
                 graph_nodes=[],
-                warning=GRAPH_EXPANSION_NO_SEED_CANDIDATES,
+                warnings=[
+                    GRAPH_EXPANSION_NO_SEED_CANDIDATES,
+                    GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE,
+                ],
                 fallback_used=True,
                 reason="graph expansion has no seed candidates",
                 debug=debug,
@@ -88,7 +92,10 @@ class GraphExpansionPolicy:
                 seed_candidates=seeds,
                 expanded_candidates=seeds,
                 graph_nodes=self._seed_graph_nodes(retrieval_response.candidates),
-                warning=GRAPH_EXPANSION_NOT_CONFIGURED,
+                warnings=[
+                    GRAPH_EXPANSION_NOT_CONFIGURED,
+                    GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE,
+                ],
                 fallback_used=True,
                 reason="graph neighbors endpoint is not configured",
                 debug=debug,
@@ -107,7 +114,10 @@ class GraphExpansionPolicy:
                 seed_candidates=seeds,
                 expanded_candidates=seeds,
                 graph_nodes=self._seed_graph_nodes(retrieval_response.candidates),
-                warning=GRAPH_EXPANSION_NEIGHBORS_UNAVAILABLE,
+                warnings=[
+                    GRAPH_EXPANSION_NEIGHBORS_UNAVAILABLE,
+                    GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE,
+                ],
                 fallback_used=True,
                 reason="graph neighbors endpoint request failed",
                 debug=debug,
@@ -186,12 +196,15 @@ class GraphExpansionPolicy:
             node.id: node for node in self._seed_graph_nodes(retrieval_response.candidates)
         }
         graph_edges_by_id: dict[str, GraphEdge] = {}
+        neighbor_records_seen = False
 
         for seed in seeds:
             records = await self._neighbor_records(
                 seed.unit_id,
                 allowed_edge_types=sorted(allowed_edge_types),
             )
+            if records:
+                neighbor_records_seen = True
             for record in records:
                 if not isinstance(record, dict):
                     continue
@@ -241,13 +254,28 @@ class GraphExpansionPolicy:
         graph_nodes = sorted(graph_nodes_by_id.values(), key=lambda node: node.id)
         graph_edges = sorted(graph_edges_by_id.values(), key=lambda edge: edge.id)
 
+        if not neighbor_records_seen or (
+            len(expanded_by_id) == len(seeds) and not graph_edges
+        ):
+            return self._result(
+                plan=plan,
+                seed_candidates=seeds,
+                expanded_candidates=seeds,
+                graph_nodes=graph_nodes,
+                graph_edges=graph_edges,
+                warnings=[GRAPH_EXPANSION_EMPTY_OR_UNAVAILABLE],
+                fallback_used=True,
+                reason="graph neighbors returned no usable expansion records",
+                debug=debug,
+            )
+
         return self._result(
             plan=plan,
             seed_candidates=seeds,
             expanded_candidates=expanded_candidates,
             graph_nodes=graph_nodes,
             graph_edges=graph_edges,
-            warning=None,
+            warnings=[],
             fallback_used=False,
             reason="graph neighbors expanded from configured client",
             debug=debug,
@@ -500,7 +528,7 @@ class GraphExpansionPolicy:
         seed_candidates: list[ExpandedCandidate],
         expanded_candidates: list[ExpandedCandidate],
         graph_nodes: list[GraphNode],
-        warning: str | None,
+        warnings: list[str] | None,
         fallback_used: bool,
         reason: str,
         debug: bool,
@@ -512,7 +540,7 @@ class GraphExpansionPolicy:
             expanded_candidates=expanded_candidates,
             graph_nodes=graph_nodes,
             graph_edges=graph_edges,
-            warnings=[warning] if warning else [],
+            warnings=warnings or [],
             debug=None,
         )
         if debug:

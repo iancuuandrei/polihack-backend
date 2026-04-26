@@ -35,8 +35,8 @@ def test_detect_query_types_for_demo_question():
 def test_query_plan_builds_retrieval_filters_for_current_labor_question():
     plan = build_plan("Poate angajatorul să-mi scadă salariul fără act adițional?")
 
-    assert plan.legal_domain == "muncă"
-    assert plan.retrieval_filters["legal_domain"] == "muncă"
+    assert plan.legal_domain == "munca"
+    assert plan.retrieval_filters["legal_domain"] == "munca"
     assert plan.retrieval_filters["status"] == "active"
     assert plan.retrieval_filters["date_context"] == "current"
 
