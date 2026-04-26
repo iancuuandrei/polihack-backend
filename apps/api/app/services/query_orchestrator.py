@@ -95,6 +95,7 @@ class QueryOrchestrator:
             question=request.question,
             evidence_units=compiled_evidence.evidence_units,
             mode=request.mode,
+            query_frame=query_frame,
         )
         answer = self._answer_payload(draft_answer)
         citations = self._citations_from_draft(
@@ -180,9 +181,19 @@ class QueryOrchestrator:
         question: str,
         evidence_units: list[EvidenceUnit],
         mode: str,
+        query_frame,
     ) -> DraftAnswer:
         try:
-            return self.generation_adapter.generate(
+            generate = self.generation_adapter.generate
+            parameters = inspect.signature(generate).parameters
+            if "query_frame" in parameters:
+                return generate(
+                    question=question,
+                    evidence_units=evidence_units,
+                    constraints=GenerationConstraints(mode=mode),
+                    query_frame=query_frame,
+                )
+            return generate(
                 question=question,
                 evidence_units=evidence_units,
                 constraints=GenerationConstraints(mode=mode),
@@ -310,6 +321,9 @@ class QueryOrchestrator:
             "citation_unit_ids": [
                 citation.unit_id for citation in draft_answer.citations
             ],
+            "meta_intent_used": draft_answer.meta_intent_used,
+            "template_id": draft_answer.template_id,
+            "focused_evidence_unit_ids": draft_answer.focused_evidence_unit_ids,
         }
 
     def _generation_warnings(

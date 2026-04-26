@@ -117,7 +117,10 @@ async def test_query_orchestrator_generates_grounded_draft_with_debug():
     assert "generation_unverified_citation_verifier_not_run" not in warnings
     assert "nu a fost verificat final de CitationVerifier" not in response.answer.short_answer
     assert "CitationVerifier V1" not in response.answer.short_answer
-    assert response.debug.generation["generation_mode"] == "deterministic_extractive_v1"
+    assert (
+        response.debug.generation["generation_mode"]
+        == "deterministic_template_v1_labor_contract_modification"
+    )
     assert response.debug.generation["evidence_unit_count_used"] == len(response.citations)
     assert set(response.debug.generation["citation_unit_ids"]) == citation_ids
     assert response.debug.verifier["claim_extraction"]["claims_total"] > 0
