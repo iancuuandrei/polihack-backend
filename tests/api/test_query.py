@@ -1,9 +1,11 @@
 import pytest
 from fastapi.testclient import TestClient
 
+import apps.api.app.routes.query as query_route
 from apps.api.app.main import app
 from apps.api.app.schemas import QueryRequest, RawRetrievalResponse, RetrievalCandidate
 from apps.api.app.services.query_orchestrator import QueryOrchestrator
+from apps.api.app.services.raw_retriever_client import RawRetrieverClient
 
 
 VALID_QUERY = {
@@ -14,9 +16,20 @@ VALID_QUERY = {
 }
 
 
-def post_query(payload: dict) -> object:
-    with TestClient(app) as client:
-        return client.post("/api/query", json=payload)
+def fallback_orchestrator() -> QueryOrchestrator:
+    return QueryOrchestrator(
+        raw_retriever_client=RawRetrieverClient(base_url=None, use_internal=False)
+    )
+
+
+def post_query(payload: dict, orchestrator: QueryOrchestrator | None = None) -> object:
+    original_orchestrator = query_route.orchestrator
+    query_route.orchestrator = orchestrator or fallback_orchestrator()
+    try:
+        with TestClient(app) as client:
+            return client.post("/api/query", json=payload)
+    finally:
+        query_route.orchestrator = original_orchestrator
 
 
 def test_post_api_query_returns_unverified_fallback_without_retrieval():
@@ -64,7 +77,7 @@ def test_post_api_query_debug_true_includes_debug_payload():
     assert debug["evidence_service"] == "MockEvidenceService"
     assert debug["retrieval_mode"] == "fallback_unconfigured"
     assert debug["evidence_units_count"] == 0
-    assert debug["query_understanding"]["legal_domain"] == "muncă"
+    assert debug["query_understanding"]["legal_domain"] == "munca"
     assert debug["query_understanding"]["domain_confidence"] >= 0.70
     assert "prohibition" in debug["query_understanding"]["query_types"]
     assert "obligation" in debug["query_understanding"]["query_types"]
@@ -72,7 +85,8 @@ def test_post_api_query_debug_true_includes_debug_payload():
     assert debug["query_understanding"]["retrieval_filters"]["status"] == "active"
     retrieval = debug["retrieval"]
     assert retrieval["fallback_used"] is True
-    assert retrieval["request_payload"]["retrieval_filters"]["legal_domain"] == "muncă"
+    assert retrieval["request_payload"]["filters"]["legal_domain"] == "munca"
+    assert retrieval["request_payload"]["retrieval_filters"]["legal_domain"] == "munca"
     assert retrieval["request_payload"]["exact_citations"] == []
     assert retrieval["response_summary"]["candidate_count"] == 0
     assert "raw_retrieval_not_configured" in retrieval["response_summary"]["warnings"]
@@ -139,7 +153,7 @@ def test_post_api_query_debug_true_includes_exact_citations():
     payload = response.json()
     citation = payload["debug"]["query_understanding"]["exact_citations"][0]
     retrieval = payload["debug"]["retrieval"]
-    assert payload["debug"]["query_understanding"]["legal_domain"] == "muncă"
+    assert payload["debug"]["query_understanding"]["legal_domain"] == "munca"
     assert citation["article"] == "41"
     assert citation["paragraph"] == "1"
     assert citation["law_id_hint"] == "ro.codul_muncii"
@@ -164,6 +178,56 @@ def test_post_api_query_debug_true_includes_exact_citations():
     assert payload["debug"]["graph_expansion"]["fallback_used"] is True
     assert payload["debug"]["legal_ranker"]["fallback_used"] is True
     assert payload["debug"]["evidence_pack"]["fallback_used"] is True
+
+
+def test_post_api_query_demo_uses_raw_retriever_client_internal_candidates():
+    orchestrator = QueryOrchestrator(
+        raw_retriever_client=RawRetrieverClient(
+            base_url=None,
+            internal_retriever_factory=lambda: Art41InternalRetriever(),
+        )
+    )
+
+    response = post_query({**VALID_QUERY, "debug": True}, orchestrator=orchestrator)
+
+    assert response.status_code == 200
+    payload = response.json()
+    evidence_ids = {unit["id"] for unit in payload["evidence_units"]}
+    assert evidence_ids.intersection(
+        {
+            "ro.codul_muncii.art_41",
+            "ro.codul_muncii.art_41.alin_1",
+            "ro.codul_muncii.art_41.alin_2",
+            "ro.codul_muncii.art_41.alin_3",
+            "ro.codul_muncii.art_41.alin_3.lit_e",
+        }
+    )
+    assert payload["evidence_units"]
+    first = payload["evidence_units"][0]
+    assert first["raw_text"]
+    assert first["law_id"] == "ro.codul_muncii"
+    assert first["law_title"] == "Codul muncii"
+    assert first["article_number"] == "41"
+    assert "retrieval_score" in first
+    assert "rerank_score" in first
+    assert "why_selected" in first
+    assert {
+        "bm25_score",
+        "dense_score",
+        "domain_match",
+        "temporal_validity",
+    }.issubset(first["score_breakdown"])
+    assert "raw_retrieval_not_configured" not in payload["warnings"]
+    assert "raw_retrieval_unavailable" not in payload["warnings"]
+    retrieval_debug = payload["debug"]["retrieval"]
+    assert retrieval_debug["backend"] == "internal"
+    assert retrieval_debug["response_summary"]["candidate_count"] >= 5
+    assert retrieval_debug["request_payload"]["filters"] == {
+        "legal_domain": "munca",
+        "status": "active",
+        "date_context": "current",
+    }
+    assert payload["debug"]["evidence_pack"]["selected_evidence_count"] > 0
 
 
 class FakeRawRetrieverClient:
@@ -206,6 +270,131 @@ class FakeRawRetrieverClient:
             if debug
             else None,
         )
+
+
+class Art41InternalRetriever:
+    async def retrieve(self, request):
+        assert request.filters["legal_domain"] == "munca"
+        assert request.filters["status"] == "active"
+        assert request.top_k == 50
+        candidates = []
+        for index, unit in enumerate(_art41_units(), start=1):
+            candidates.append(
+                RetrievalCandidate(
+                    unit_id=unit["id"],
+                    rank=index,
+                    retrieval_score=round(0.95 - index * 0.03, 6),
+                    score_breakdown={
+                        "bm25": round(1.0 - index * 0.05, 6),
+                        "dense": 0.0,
+                        "domain_match": 1.0,
+                        "metadata_validity": 1.0,
+                        "exact_citation_boost": 0.0,
+                        "rrf": round(0.05 - index * 0.002, 6),
+                    },
+                    matched_terms=["salariu", "contract", "act aditional"],
+                    why_retrieved="lexical match",
+                    unit=unit,
+                )
+            )
+        return RawRetrievalResponse(
+            candidates=candidates,
+            retrieval_methods=["internal_fixture"],
+            warnings=["dense_retrieval_skipped_no_query_embedding"],
+            debug={
+                "candidate_count": len(candidates),
+                "warnings": ["dense_retrieval_skipped_no_query_embedding"],
+            },
+        )
+
+
+def _art41_units():
+    base = {
+        "canonical_id": None,
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "legal_domain": "munca",
+        "legal_concepts": ["contract", "salariu"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    }
+    return [
+        {
+            **base,
+            "id": "ro.codul_muncii.art_41.alin_1",
+            "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (1)"],
+            "article_number": "41",
+            "paragraph_number": "1",
+            "letter_number": None,
+            "point_number": None,
+            "parent_id": "ro.codul_muncii.art_41",
+            "raw_text": "(1) Contractul individual de munca poate fi modificat numai prin acordul partilor.",
+            "normalized_text": "contract individual munca modificat acord parti act aditional salariu",
+            "type": "alineat",
+        },
+        {
+            **base,
+            "id": "ro.codul_muncii.art_41",
+            "hierarchy_path": ["Codul muncii", "Art. 41"],
+            "article_number": "41",
+            "paragraph_number": None,
+            "letter_number": None,
+            "point_number": None,
+            "parent_id": None,
+            "raw_text": "Articolul 41\nContractul individual de munca poate fi modificat numai prin acordul partilor.",
+            "normalized_text": "contract individual munca modificat acord parti",
+            "type": "articol",
+        },
+        {
+            **base,
+            "id": "ro.codul_muncii.art_41.alin_2",
+            "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (2)"],
+            "article_number": "41",
+            "paragraph_number": "2",
+            "letter_number": None,
+            "point_number": None,
+            "parent_id": "ro.codul_muncii.art_41",
+            "raw_text": "(2) Modificarea contractului individual de munca se refera la elementele contractuale.",
+            "normalized_text": "modificare contract individual munca elemente contractuale",
+            "type": "alineat",
+        },
+        {
+            **base,
+            "id": "ro.codul_muncii.art_41.alin_3",
+            "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (3)"],
+            "article_number": "41",
+            "paragraph_number": "3",
+            "letter_number": None,
+            "point_number": None,
+            "parent_id": "ro.codul_muncii.art_41",
+            "raw_text": "(3) Modificarea contractului individual de munca poate privi durata, locul muncii, felul muncii, conditiile de munca, salariul si timpul de munca.",
+            "normalized_text": "modificare contract individual munca durata loc fel conditii salariu timp",
+            "type": "alineat",
+        },
+        {
+            **base,
+            "id": "ro.codul_muncii.art_41.alin_3.lit_e",
+            "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (3)", "Lit. e)"],
+            "article_number": "41",
+            "paragraph_number": "3",
+            "letter_number": "e",
+            "point_number": None,
+            "parent_id": "ro.codul_muncii.art_41.alin_3",
+            "raw_text": "e) salariul;",
+            "normalized_text": "salariul",
+            "type": "litera",
+        },
+    ]
 
 
 @pytest.mark.anyio
@@ -253,7 +442,7 @@ async def test_query_orchestrator_populates_evidence_units_with_fake_candidates(
 def test_handoff04_graph_endpoints_are_not_registered():
     paths = {route.path for route in app.routes}
 
-    assert "/api/retrieve/raw" not in paths
+    assert "/api/retrieve/raw" in paths
     assert "/api/legal-units/{id}/neighbors" not in paths
     assert "/api/explore/root" not in paths
     assert "/api/explore/node/{id}/children" not in paths

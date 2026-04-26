@@ -9,7 +9,7 @@ def route(question: str):
 def test_demo_salary_question_routes_to_labor_domain():
     result = route("Poate angajatorul să-mi scadă salariul fără act adițional?")
 
-    assert result.legal_domain == "muncă"
+    assert result.legal_domain == "munca"
     assert result.domain_confidence >= 0.70
 
 
@@ -22,31 +22,31 @@ def test_fiscal_question_routes_to_fiscal():
 def test_gdpr_question_routes_to_data_protection():
     result = route("Ce drepturi am pentru date personale conform GDPR?")
 
-    assert result.legal_domain == "protecția datelor"
+    assert result.legal_domain == "protectia_datelor"
 
 
 def test_contravention_question_routes_to_contravention():
     result = route("Cum contest o amendă din proces-verbal contravențional?")
 
-    assert result.legal_domain == "contravențional"
+    assert result.legal_domain == "contraventional"
 
 
 def test_contravention_question_without_diacritics_routes_to_contravention():
     result = route("Cum contest o amenda din proces-verbal contraventional?")
 
-    assert result.legal_domain == "contravențional"
+    assert result.legal_domain == "contraventional"
 
 
 def test_labor_question_without_diacritics_routes_to_labor():
     result = route("Poate angajatorul sa scada salariul fara act aditional?")
 
-    assert result.legal_domain == "muncă"
+    assert result.legal_domain == "munca"
 
 
 def test_named_labor_code_routes_to_labor():
     result = route("Ce spune art. 41 din Codul muncii?")
 
-    assert result.legal_domain == "muncă"
+    assert result.legal_domain == "munca"
 
 
 def test_civil_question_routes_to_civil():

@@ -30,6 +30,7 @@ from .ranking import (
     RankerFeatureBreakdown,
 )
 from .retrieval import (
+    RawExactCitation,
     RawRetrievalRequest,
     RawRetrievalResponse,
     RetrievalCandidate,
@@ -61,5 +62,6 @@ __all__ = [
     "VerifierStatus",
     "RawRetrievalRequest",
     "RawRetrievalResponse",
+    "RawExactCitation",
     "RetrievalCandidate",
 ]

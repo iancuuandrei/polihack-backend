@@ -113,15 +113,23 @@ class DomainRouter:
 
     def route(self, normalized_question: str) -> DomainRoute:
         match_text = strip_ro_diacritics(normalized_question).casefold()
-        scores = {
+        raw_scores = {
             domain: self._score_domain(match_text, terms)
             for domain, terms in self.lexicon.items()
         }
-        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        ranked = sorted(raw_scores.items(), key=lambda item: item[1], reverse=True)
         best_domain, best_score = ranked[0]
         second_score = ranked[1][1] if len(ranked) > 1 else 0.0
 
-        legal_domain = best_domain if best_score >= DOMAIN_THRESHOLD else None
+        scores = {
+            self._canonical_domain(domain): score
+            for domain, score in raw_scores.items()
+        }
+        legal_domain = (
+            self._canonical_domain(best_domain)
+            if best_score >= DOMAIN_THRESHOLD
+            else None
+        )
         ambiguity_flags: list[str] = []
         if legal_domain is None:
             ambiguity_flags.append("low_domain_confidence")
@@ -143,3 +151,6 @@ class DomainRouter:
             if normalized_term in match_text:
                 raw_score += 1.0
         return round(min(1.0, raw_score / SCORE_NORMALIZER), 2)
+
+    def _canonical_domain(self, domain: str) -> str:
+        return "_".join(strip_ro_diacritics(domain).casefold().split())
