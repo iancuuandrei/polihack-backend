@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--import-run-id", default=None)
     parser.add_argument("--with-embeddings", action="store_true")
     parser.add_argument("--embedding-dim", type=int, default=2560)
+    parser.add_argument("--progress", action="store_true", help="Write safe import progress to stderr.")
+    parser.add_argument(
+        "--limit-units",
+        type=_non_negative_int,
+        default=None,
+        help="Debug only: import only the first N legal_units records.",
+    )
+    parser.add_argument(
+        "--limit-edges",
+        type=_non_negative_int,
+        default=None,
+        help="Debug only: import only the first N legal_edges records.",
+    )
+    parser.add_argument(
+        "--statement-timeout-seconds",
+        type=_non_negative_int,
+        default=0,
+        help="Apply SET LOCAL statement_timeout inside the import transaction.",
+    )
+    parser.add_argument(
+        "--debug-errors",
+        action="store_true",
+        help="Include sanitized exception details for DB errors.",
+    )
     return parser
 
 
@@ -46,13 +72,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
-    database_url = (args.database_url or os.getenv("DATABASE_URL") or "").strip()
+    database_url = (
+        args.database_url
+        or os.getenv("DATABASE_ASYNCPG_URL")
+        or os.getenv("DATABASE_URL")
+        or ""
+    ).strip()
     if args.mode == "apply" and not database_url:
         return _emit(
             {
                 "ok": False,
                 "status": "unsupported",
-                "error": "DATABASE_URL is required for apply mode",
+                "error": "DATABASE_URL or DATABASE_ASYNCPG_URL is required for apply mode",
             },
             pretty=args.pretty,
             stream=sys.stderr,
@@ -102,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                 duration_seconds=_duration(started),
                 with_embeddings=args.with_embeddings,
                 embedding_dim=args.embedding_dim if args.with_embeddings else None,
+                **_summary_options(args),
             ),
             pretty=args.pretty,
             exit_code=_invalid_plan_exit_code(args, plan),
@@ -116,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
                 duration_seconds=_duration(started),
                 with_embeddings=args.with_embeddings,
                 embedding_dim=args.embedding_dim if args.with_embeddings else None,
+                **_summary_options(args),
             ),
             pretty=args.pretty,
             exit_code=EXIT_VALID,
@@ -133,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.with_embeddings
             else None
         )
+        legal_units = _limit_records(legal_units, args.limit_units)
+        legal_edges = _limit_records(legal_edges, args.limit_edges)
     except ValueError as exc:
         return _emit(
             {
@@ -142,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
                 "source_dir": plan.source_dir,
                 "errors": [{"code": "artifact_load_failed", "message": str(exc)}],
                 "duration_seconds": _duration(started),
+                **_summary_options(args),
             },
             pretty=args.pretty,
             exit_code=EXIT_INVALID_EMBEDDINGS if args.with_embeddings else EXIT_INVALID_BUNDLE,
@@ -151,31 +187,41 @@ def main(argv: list[str] | None = None) -> int:
         repository_class = _get_repository_class()
         repository = repository_class(database_url)
         repository.ensure_schema()
+        progress_callback = _progress_callback(args.progress)
+        apply_kwargs: dict[str, Any] = {
+            "plan": plan,
+            "legal_units": legal_units,
+            "legal_edges": legal_edges,
+        }
+        if progress_callback is not None:
+            apply_kwargs["progress_callback"] = progress_callback
+        if args.statement_timeout_seconds:
+            apply_kwargs["statement_timeout_seconds"] = args.statement_timeout_seconds
         if args.with_embeddings:
+            apply_kwargs["embeddings"] = embeddings
+            apply_kwargs["expected_embedding_dim"] = args.embedding_dim
             apply_result = repository.apply_import_plan(
-                plan,
-                legal_units=legal_units,
-                legal_edges=legal_edges,
-                embeddings=embeddings,
-                expected_embedding_dim=args.embedding_dim,
+                **apply_kwargs,
             )
         else:
             apply_result = repository.apply_import_plan(
-                plan,
-                legal_units=legal_units,
-                legal_edges=legal_edges,
+                **apply_kwargs,
             )
     except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "db_error",
+            "import_run_id": plan.import_run_id,
+            "source_dir": plan.source_dir,
+            "error": "database import failed; transaction rolled back",
+            "error_type": type(exc).__name__,
+            "duration_seconds": _duration(started),
+            **_summary_options(args),
+        }
+        if args.debug_errors:
+            payload.update(_debug_error_payload(exc))
         return _emit(
-            {
-                "ok": False,
-                "status": "db_error",
-                "import_run_id": plan.import_run_id,
-                "source_dir": plan.source_dir,
-                "error": "database import failed; transaction rolled back",
-                "error_type": type(exc).__name__,
-                "duration_seconds": _duration(started),
-            },
+            payload,
             pretty=args.pretty,
             stream=sys.stderr,
             exit_code=EXIT_DB_ERROR,
@@ -190,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
             apply_counts=apply_result.counts,
             with_embeddings=args.with_embeddings,
             embedding_dim=args.embedding_dim if args.with_embeddings else None,
+            **_summary_options(args),
         ),
         pretty=args.pretty,
         exit_code=EXIT_VALID,
@@ -205,6 +252,10 @@ def _summary(
     apply_counts: dict[str, Any] | None = None,
     with_embeddings: bool = False,
     embedding_dim: int | None = None,
+    limited_debug_run: bool = False,
+    limit_units: int | None = None,
+    limit_edges: int | None = None,
+    statement_timeout_seconds: int = 0,
 ) -> dict[str, Any]:
     counts = apply_counts or {
         "legal_units": {
@@ -247,6 +298,12 @@ def _summary(
         "counts": counts,
         "embedding_dim": embedding_dim,
         "model_name": model_name,
+        "limited_debug_run": limited_debug_run,
+        "limits": {
+            "legal_units": limit_units,
+            "legal_edges": limit_edges,
+        },
+        "statement_timeout_seconds": statement_timeout_seconds,
         "warnings": [warning.model_dump() for warning in plan.warnings],
         "errors": [error.model_dump() for error in plan.errors],
         "duration_seconds": duration_seconds,
@@ -359,6 +416,41 @@ def _optional_string(value: Any) -> str | None:
     return value
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be greater than or equal to 0")
+    return parsed
+
+
+def _limit_records(records: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    if limit is None:
+        return records
+    return records[:limit]
+
+
+def _summary_options(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "limited_debug_run": args.limit_units is not None or args.limit_edges is not None,
+        "limit_units": args.limit_units,
+        "limit_edges": args.limit_edges,
+        "statement_timeout_seconds": args.statement_timeout_seconds,
+    }
+
+
+def _progress_callback(enabled: bool):
+    if not enabled:
+        return None
+
+    def emit(message: str) -> None:
+        print(_sanitize_debug_text(message), file=sys.stderr, flush=True)
+
+    return emit
+
+
 def _invalid_plan_exit_code(args: argparse.Namespace, plan) -> int:
     if args.mode == "apply" and args.with_embeddings and _has_embedding_errors(plan):
         return EXIT_INVALID_EMBEDDINGS
@@ -406,6 +498,44 @@ def _embedding_model_name(path: str | None) -> str | None:
 
 def _duration(started: float) -> float:
     return round(time.perf_counter() - started, 4)
+
+
+def _debug_error_payload(exc: Exception) -> dict[str, Any]:
+    traceback_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return {
+        "error_message": _sanitize_debug_text(str(exc)),
+        "error_repr": _sanitize_debug_text(repr(exc)),
+        "traceback_tail": [
+            _sanitize_debug_text(line.rstrip("\n")) for line in traceback_lines[-20:]
+        ],
+    }
+
+
+def _sanitize_debug_text(text: str) -> str:
+    sanitized = text
+    for pattern, replacement in _DEBUG_REDACTIONS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
+
+
+_DEBUG_REDACTIONS = (
+    (
+        re.compile(r"(?i)\b(postgres(?:ql)?(?:\+asyncpg)?://)([^:@/\s]+):([^@/\s]+)@"),
+        r"\1\2:***@",
+    ),
+    (re.compile(r"(?i)(\bpassword=)([^&\s;]+)"), r"\1***"),
+    (re.compile(r"(?i)(\b(?:DATABASE_URL|DATABASE_ASYNCPG_URL)=)(\S+)"), r"\1***"),
+    (
+        re.compile(
+            r"(?is)((?:['\"])?(?:raw_text|normalized_text|embedding_text)(?:['\"])?\s*[:=]\s*)(['\"])(.*?)(\2)"
+        ),
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>{match.group(4)}",
+    ),
+    (
+        re.compile(r"(?is)((?:['\"])?embedding(?:['\"])?\s*[:=]\s*)\[[^\]]*\]"),
+        r"\1[<redacted>]",
+    ),
+)
 
 
 def _get_repository_class():

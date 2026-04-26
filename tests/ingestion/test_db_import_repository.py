@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from ingestion.import_repository import PostgresImportRepository
+from ingestion import import_repository
 from ingestion.imports import build_import_plan
 
 
@@ -29,6 +31,14 @@ def test_postgres_import_repository_upsert_legal_units_is_idempotent():
     assert second.updated == 0
     assert second.unchanged == 1
     assert len(connection.legal_units) == 1
+
+
+def test_repository_schema_loader_reads_all_import_migrations():
+    sql = "\n".join(import_repository._migration_statements())
+
+    assert "CREATE TABLE IF NOT EXISTS legal_units" in sql
+    assert "CREATE TABLE IF NOT EXISTS legal_edges" in sql
+    assert "CREATE TABLE IF NOT EXISTS legal_embeddings" in sql
 
 
 def test_postgres_import_repository_upsert_legal_units_updates_changed_rows():
@@ -187,6 +197,59 @@ def test_repeated_apply_does_not_duplicate_embeddings(tmp_path):
     assert len(connection.legal_embeddings) == 1
 
 
+def test_apply_import_plan_sets_statement_timeout_and_emits_progress(tmp_path):
+    source_dir = _write_bundle(tmp_path)
+    plan = build_import_plan(source_dir, mode="apply")
+    connection = FakeConnection()
+    repository = PostgresImportRepository(
+        "postgresql://lexai:test@localhost/lexai",
+        connect_func=lambda _: connection,
+    )
+    messages = []
+
+    result = repository.apply_import_plan(
+        plan,
+        legal_units=[_legal_unit("ro.test"), _legal_unit("ro.test.art_1")],
+        legal_edges=[_legal_edge("edge.1", "ro.test", "ro.test.art_1")],
+        progress_callback=messages.append,
+        statement_timeout_seconds=7,
+    )
+
+    assert result.status == "succeeded"
+    assert "SET LOCAL statement_timeout = 7000" in connection.executed
+    assert any(message.startswith("started import_run") for message in messages)
+    assert "legal_units progress processed=2 total=2" in messages
+    assert "legal_edges progress processed=1 total=1" in messages
+    assert any(message.startswith("finalized import_run") for message in messages)
+
+
+def test_upsert_legal_units_uses_batches_and_reports_each_chunk():
+    connection = FakeConnection()
+    repository = PostgresImportRepository(
+        "postgresql://lexai:test@localhost/lexai",
+        connect_func=lambda _: connection,
+    )
+    records = [_legal_unit(f"ro.test.art_{index}") for index in range(101)]
+    messages = []
+
+    result = repository.upsert_legal_units(records)
+    progress_result = repository.upsert_legal_units(records)
+    progressed = asyncio.run(
+        repository.aupsert_legal_units(
+            records,
+            connection=connection,
+            progress_callback=messages.append,
+        )
+    )
+
+    assert result.inserted == 101
+    assert progress_result.unchanged == 101
+    assert progressed.unchanged == 101
+    assert connection.fetch_calls >= 6
+    assert "legal_units progress processed=100 total=101" in messages
+    assert "legal_units progress processed=101 total=101" in messages
+
+
 @pytest.mark.skipif(
     not os.getenv("DATABASE_URL_TEST"),
     reason="DATABASE_URL_TEST is not configured for PostgreSQL integration tests",
@@ -246,6 +309,8 @@ class FakeConnection:
         self.closed = False
         self.committed = False
         self.rolled_back = False
+        self.executed = []
+        self.fetch_calls = 0
 
     def transaction(self):
         return FakeTransaction(self)
@@ -254,7 +319,22 @@ class FakeConnection:
         self.closed = True
 
     async def execute(self, statement):
+        self.executed.append(statement)
         return "OK"
+
+    async def fetch(self, sql, *params):
+        self.fetch_calls += 1
+        if "INSERT INTO legal_units" in sql:
+            return self._upsert_many(self.legal_units, params, 24)
+        if "INSERT INTO legal_edges" in sql:
+            if self.fail_on_edge:
+                raise RuntimeError("edge upsert failed")
+            return self._upsert_many(self.legal_edges, params, 7)
+        if "INSERT INTO legal_embeddings" in sql:
+            if self.fail_on_embedding:
+                raise RuntimeError("embedding upsert failed")
+            return self._upsert_embeddings_many(self.legal_embeddings, params, 9)
+        raise AssertionError("unexpected SQL")
 
     async def fetchrow(self, sql, *params):
         if "INSERT INTO legal_units" in sql:
@@ -304,6 +384,15 @@ class FakeConnection:
         table[record_id] = params
         return {"inserted": False}
 
+    @classmethod
+    def _upsert_many(cls, table, params, width):
+        rows = []
+        for record in cls._split_params(params, width):
+            row = cls._upsert(table, record)
+            if row is not None:
+                rows.append(row)
+        return rows
+
     @staticmethod
     def _upsert_embedding(table, params):
         key = (params[0], params[3], params[5])
@@ -315,6 +404,19 @@ class FakeConnection:
             return None
         table[key] = params
         return {"inserted": False}
+
+    @classmethod
+    def _upsert_embeddings_many(cls, table, params, width):
+        rows = []
+        for record in cls._split_params(params, width):
+            row = cls._upsert_embedding(table, record)
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    @staticmethod
+    def _split_params(params, width):
+        return [tuple(params[index : index + width]) for index in range(0, len(params), width)]
 
 
 def _write_bundle(tmp_path: Path, *, with_embeddings: bool = False) -> Path:

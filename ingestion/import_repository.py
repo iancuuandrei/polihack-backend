@@ -28,7 +28,6 @@ MIGRATIONS_DIR = (
     / "app"
     / "db"
     / "migrations"
-    / "0001_h08_d2_legal_import_tables.sql"
 )
 
 
@@ -51,6 +50,8 @@ class ImportBundleApplyResult(BaseModel):
 
 
 ConnectFunc = Callable[[str], Any | Awaitable[Any]]
+ProgressCallback = Callable[[str], None]
+UPSERT_BATCH_SIZE = 100
 
 
 class PostgresImportRepository:
@@ -85,15 +86,24 @@ class PostgresImportRepository:
         records: Iterable[Mapping[str, Any]],
         *,
         connection: Any | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> ImportRepositoryResult:
         prepared_records = [_legal_unit_params(record) for record in records]
         if not prepared_records:
             return ImportRepositoryResult()
         if connection is not None:
-            return await self._upsert_legal_units(connection, prepared_records)
+            return await self._upsert_legal_units(
+                connection,
+                prepared_records,
+                progress_callback=progress_callback,
+            )
         async with self._managed_connection() as managed_connection:
             async with managed_connection.transaction():
-                return await self._upsert_legal_units(managed_connection, prepared_records)
+                return await self._upsert_legal_units(
+                    managed_connection,
+                    prepared_records,
+                    progress_callback=progress_callback,
+                )
 
     def upsert_legal_edges(
         self,
@@ -106,15 +116,24 @@ class PostgresImportRepository:
         records: Iterable[Mapping[str, Any]],
         *,
         connection: Any | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> ImportRepositoryResult:
         prepared_records = [_legal_edge_params(record) for record in records]
         if not prepared_records:
             return ImportRepositoryResult()
         if connection is not None:
-            return await self._upsert_legal_edges(connection, prepared_records)
+            return await self._upsert_legal_edges(
+                connection,
+                prepared_records,
+                progress_callback=progress_callback,
+            )
         async with self._managed_connection() as managed_connection:
             async with managed_connection.transaction():
-                return await self._upsert_legal_edges(managed_connection, prepared_records)
+                return await self._upsert_legal_edges(
+                    managed_connection,
+                    prepared_records,
+                    progress_callback=progress_callback,
+                )
 
     def upsert_embeddings(
         self,
@@ -130,6 +149,7 @@ class PostgresImportRepository:
         *,
         expected_dim: int = DEFAULT_EMBEDDING_DIM,
         connection: Any | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> ImportRepositoryResult:
         prepared_records = [
             _embedding_params(record, expected_dim=expected_dim) for record in records
@@ -137,10 +157,18 @@ class PostgresImportRepository:
         if not prepared_records:
             return ImportRepositoryResult()
         if connection is not None:
-            return await self._upsert_embeddings(connection, prepared_records)
+            return await self._upsert_embeddings(
+                connection,
+                prepared_records,
+                progress_callback=progress_callback,
+            )
         async with self._managed_connection() as managed_connection:
             async with managed_connection.transaction():
-                return await self._upsert_embeddings(managed_connection, prepared_records)
+                return await self._upsert_embeddings(
+                    managed_connection,
+                    prepared_records,
+                    progress_callback=progress_callback,
+                )
 
     def record_import_run(self, plan: ImportPlan) -> ImportRunRepositoryResult:
         return _run_sync(self.arecord_import_run(plan))
@@ -214,6 +242,8 @@ class PostgresImportRepository:
         legal_edges: Iterable[Mapping[str, Any]],
         embeddings: Iterable[Mapping[str, Any]] | None = None,
         expected_embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+        progress_callback: ProgressCallback | None = None,
+        statement_timeout_seconds: int = 0,
     ) -> ImportBundleApplyResult:
         return _run_sync(
             self.aapply_import_plan(
@@ -222,6 +252,8 @@ class PostgresImportRepository:
                 legal_edges=legal_edges,
                 embeddings=embeddings,
                 expected_embedding_dim=expected_embedding_dim,
+                progress_callback=progress_callback,
+                statement_timeout_seconds=statement_timeout_seconds,
             )
         )
 
@@ -233,25 +265,35 @@ class PostgresImportRepository:
         legal_edges: Iterable[Mapping[str, Any]],
         embeddings: Iterable[Mapping[str, Any]] | None = None,
         expected_embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+        progress_callback: ProgressCallback | None = None,
+        statement_timeout_seconds: int = 0,
     ) -> ImportBundleApplyResult:
+        if statement_timeout_seconds < 0:
+            raise ValueError("statement_timeout_seconds must be greater than or equal to 0")
         unit_records = list(legal_units)
         edge_records = list(legal_edges)
         embedding_records = list(embeddings or [])
         async with self._managed_connection() as connection:
             async with connection.transaction():
+                if statement_timeout_seconds:
+                    await _set_statement_timeout(connection, statement_timeout_seconds)
                 await self._record_import_run(connection, plan)
+                _emit_progress(progress_callback, f"started import_run id={plan.import_run_id}")
                 units_result = await self.aupsert_legal_units(
                     unit_records,
                     connection=connection,
+                    progress_callback=progress_callback,
                 )
                 edges_result = await self.aupsert_legal_edges(
                     edge_records,
                     connection=connection,
+                    progress_callback=progress_callback,
                 )
                 embeddings_result = await self.aupsert_embeddings(
                     embedding_records,
                     expected_dim=expected_embedding_dim,
                     connection=connection,
+                    progress_callback=progress_callback,
                 )
                 apply_result = ImportBundleApplyResult(
                     import_run_id=plan.import_run_id,
@@ -268,6 +310,7 @@ class PostgresImportRepository:
                     errors=[],
                     warnings=[warning.model_dump() for warning in plan.warnings],
                 )
+                _emit_progress(progress_callback, f"finalized import_run id={plan.import_run_id}")
                 return apply_result
 
     @asynccontextmanager
@@ -284,69 +327,51 @@ class PostgresImportRepository:
         self,
         connection: Any,
         records: list[tuple[Any, ...]],
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> ImportRepositoryResult:
-        inserted = 0
-        updated = 0
-        unchanged = 0
-        for params in records:
-            row = await connection.fetchrow(_UPSERT_LEGAL_UNIT_SQL, *params)
-            if row is None:
-                unchanged += 1
-            elif bool(row["inserted"]):
-                inserted += 1
-            else:
-                updated += 1
-        return ImportRepositoryResult(
-            attempted=len(records),
-            inserted=inserted,
-            updated=updated,
-            unchanged=unchanged,
+        return await _run_upsert_batches(
+            connection,
+            records,
+            sql_template=_UPSERT_LEGAL_UNIT_SQL,
+            parameter_count=24,
+            parameter_casts={13: "::jsonb", 21: "::jsonb", 24: "::jsonb"},
+            progress_label="legal_units",
+            progress_callback=progress_callback,
         )
 
     async def _upsert_legal_edges(
         self,
         connection: Any,
         records: list[tuple[Any, ...]],
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> ImportRepositoryResult:
-        inserted = 0
-        updated = 0
-        unchanged = 0
-        for params in records:
-            row = await connection.fetchrow(_UPSERT_LEGAL_EDGE_SQL, *params)
-            if row is None:
-                unchanged += 1
-            elif bool(row["inserted"]):
-                inserted += 1
-            else:
-                updated += 1
-        return ImportRepositoryResult(
-            attempted=len(records),
-            inserted=inserted,
-            updated=updated,
-            unchanged=unchanged,
+        return await _run_upsert_batches(
+            connection,
+            records,
+            sql_template=_UPSERT_LEGAL_EDGE_SQL,
+            parameter_count=7,
+            parameter_casts={7: "::jsonb"},
+            progress_label="legal_edges",
+            progress_callback=progress_callback,
         )
 
     async def _upsert_embeddings(
         self,
         connection: Any,
         records: list[tuple[Any, ...]],
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> ImportRepositoryResult:
-        inserted = 0
-        updated = 0
-        unchanged = 0
-        for params in records:
-            row = await connection.fetchrow(_UPSERT_EMBEDDING_SQL, *params)
-            if row is None:
-                unchanged += 1
-            elif bool(row["inserted"]):
-                inserted += 1
-            else:
-                updated += 1
-        return ImportRepositoryResult(
-            attempted=len(records),
-            inserted=inserted,
-            updated=updated,
-            unchanged=unchanged,
+        return await _run_upsert_batches(
+            connection,
+            records,
+            sql_template=_UPSERT_EMBEDDING_SQL,
+            parameter_count=9,
+            parameter_casts={7: "::vector", 8: "::jsonb"},
+            progress_label="embeddings",
+            progress_callback=progress_callback,
         )
 
     async def _record_import_run(
@@ -399,6 +424,144 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def _set_statement_timeout(connection: Any, seconds: int) -> None:
+    milliseconds = int(seconds) * 1000
+    await connection.execute(f"SET LOCAL statement_timeout = {milliseconds}")
+
+
+async def _run_upsert_batches(
+    connection: Any,
+    records: list[tuple[Any, ...]],
+    *,
+    sql_template: str,
+    parameter_count: int,
+    parameter_casts: Mapping[int, str],
+    progress_label: str,
+    progress_callback: ProgressCallback | None,
+) -> ImportRepositoryResult:
+    inserted = 0
+    updated = 0
+    unchanged = 0
+    processed = 0
+    fetch_many = getattr(connection, "fetch", None)
+    for batch in _chunks(records, UPSERT_BATCH_SIZE):
+        if fetch_many is None:
+            batch_rows = await _run_upsert_batch_row_by_row(
+                connection,
+                batch,
+                sql_template=sql_template,
+                parameter_count=parameter_count,
+                parameter_casts=parameter_casts,
+            )
+        else:
+            batch_rows = await fetch_many(
+                _upsert_sql(
+                    sql_template,
+                    row_count=len(batch),
+                    parameter_count=parameter_count,
+                    parameter_casts=parameter_casts,
+                ),
+                *_flatten(batch),
+            )
+        batch_inserted, batch_updated, batch_unchanged = _upsert_result_counts(
+            batch_size=len(batch),
+            rows=batch_rows,
+        )
+        inserted += batch_inserted
+        updated += batch_updated
+        unchanged += batch_unchanged
+        processed += len(batch)
+        _emit_progress(
+            progress_callback,
+            f"{progress_label} progress processed={processed} total={len(records)}",
+        )
+    return ImportRepositoryResult(
+        attempted=len(records),
+        inserted=inserted,
+        updated=updated,
+        unchanged=unchanged,
+    )
+
+
+async def _run_upsert_batch_row_by_row(
+    connection: Any,
+    batch: list[tuple[Any, ...]],
+    *,
+    sql_template: str,
+    parameter_count: int,
+    parameter_casts: Mapping[int, str],
+) -> list[Any]:
+    sql = _upsert_sql(
+        sql_template,
+        row_count=1,
+        parameter_count=parameter_count,
+        parameter_casts=parameter_casts,
+    )
+    rows: list[Any] = []
+    for params in batch:
+        row = await connection.fetchrow(sql, *params)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _upsert_result_counts(*, batch_size: int, rows: Iterable[Any]) -> tuple[int, int, int]:
+    returned_rows = list(rows)
+    inserted = sum(1 for row in returned_rows if bool(row["inserted"]))
+    updated = len(returned_rows) - inserted
+    unchanged = batch_size - len(returned_rows)
+    return inserted, updated, unchanged
+
+
+def _upsert_sql(
+    template: str,
+    *,
+    row_count: int,
+    parameter_count: int,
+    parameter_casts: Mapping[int, str],
+) -> str:
+    return template.format(
+        values=_values_clause(
+            row_count=row_count,
+            parameter_count=parameter_count,
+            parameter_casts=parameter_casts,
+        )
+    )
+
+
+def _values_clause(
+    *,
+    row_count: int,
+    parameter_count: int,
+    parameter_casts: Mapping[int, str],
+) -> str:
+    placeholders: list[str] = []
+    parameter_index = 1
+    for _ in range(row_count):
+        row_placeholders = []
+        for field_index in range(1, parameter_count + 1):
+            row_placeholders.append(
+                f"${parameter_index}{parameter_casts.get(field_index, '')}"
+            )
+            parameter_index += 1
+        placeholders.append("(" + ", ".join(row_placeholders) + ", now(), now())")
+    return ",\n".join(placeholders)
+
+
+def _flatten(batch: Iterable[tuple[Any, ...]]) -> list[Any]:
+    return [value for params in batch for value in params]
+
+
+def _chunks(records: list[tuple[Any, ...]], size: int) -> Iterable[list[tuple[Any, ...]]]:
+    for index in range(0, len(records), size):
+        yield records[index : index + size]
+
+
+def _emit_progress(callback: ProgressCallback | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
 
 
 def _to_asyncpg_url(database_url: str) -> str:
@@ -579,11 +742,7 @@ INSERT INTO legal_units (
     parser_warnings,
     created_at,
     updated_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb,
-    $14, $15, $16, $17, $18, $19, $20, $21::jsonb, $22, $23, $24::jsonb,
-    now(), now()
-)
+) VALUES {values}
 ON CONFLICT (id) DO UPDATE SET
     canonical_id = EXCLUDED.canonical_id,
     source_id = EXCLUDED.source_id,
@@ -673,9 +832,7 @@ INSERT INTO legal_edges (
     metadata,
     created_at,
     updated_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7::jsonb, now(), now()
-)
+) VALUES {values}
 ON CONFLICT (id) DO UPDATE SET
     source_id = EXCLUDED.source_id,
     target_id = EXCLUDED.target_id,
@@ -716,9 +873,7 @@ INSERT INTO legal_embeddings (
     source_path,
     created_at,
     updated_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7::vector, $8::jsonb, $9, now(), now()
-)
+) VALUES {values}
 ON CONFLICT (record_id, model_name, text_hash) DO UPDATE SET
     legal_unit_id = EXCLUDED.legal_unit_id,
     chunk_id = EXCLUDED.chunk_id,
