@@ -9,6 +9,15 @@ class Settings(BaseSettings):
     api_cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     raw_retrieval_base_url: str | None = None
     admin_ingest_secret: str | None = None
+    enable_llm_query_decomposer: bool = False
+    llm_query_decomposer_base_url: str | None = None
+    llm_query_decomposer_api_key: str | None = None
+    llm_query_decomposer_model: str | None = None
+    llm_query_decomposer_timeout_seconds: float = 5.0
+    query_embedding_enabled: bool = False
+    ollama_base_url: str | None = None
+    query_embedding_model: str = "qwen3-embedding:4b"
+    query_embedding_timeout_seconds: float = 20.0
 
     @property
     def cors_origins(self) -> list[str]:

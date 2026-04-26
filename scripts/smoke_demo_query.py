@@ -153,6 +153,10 @@ def print_diagnostics(
                 "retrieval_score": evidence.get("retrieval_score"),
             }
         )
+    debug = query_payload.get("debug") or {}
+    evidence_pack_debug = debug.get("evidence_pack") or {}
+    print("diagnostics.requirement_coverage:")
+    print(evidence_pack_debug.get("requirement_coverage"))
     print("diagnostics.graph_highlighted_edge_ids:")
     print(graph_payload.get("highlighted_edge_ids"))
 

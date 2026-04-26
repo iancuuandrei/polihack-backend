@@ -256,10 +256,13 @@ class QueryDebugData(BaseModel):
     retrieval_mode: str
     query_understanding: QueryPlan | None = None
     query_frame: dict[str, Any] | None = None
+    query_decomposer: dict[str, Any] | None = None
+    query_embedding: dict[str, Any] | None = None
     retrieval: dict[str, Any] | None = None
     graph_expansion: dict[str, Any] | None = None
     legal_ranker: dict[str, Any] | None = None
     evidence_pack: dict[str, Any] | None = None
+    requirement_backfill: dict[str, Any] | None = None
     generation: dict[str, Any] | None = None
     verifier: dict[str, Any] | None = None
     answer_repair: dict[str, Any] | None = None
