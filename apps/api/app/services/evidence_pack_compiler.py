@@ -616,6 +616,26 @@ class EvidencePackCompiler:
         *,
         plan: QueryPlan | None,
     ) -> str:
+        score = ranked.score_breakdown
+        if "support_role_hint:context" in ranked.why_ranked:
+            return "context"
+        if "support_role_hint:direct_basis" in ranked.why_ranked:
+            return "direct_basis"
+        if "support_role_hint:definition" in ranked.why_ranked:
+            return "definition"
+        if "support_role_hint:sanction" in ranked.why_ranked:
+            return "sanction"
+        if "support_role_hint:procedure" in ranked.why_ranked:
+            return "procedure"
+        if "support_role_hint:exception" in ranked.why_ranked:
+            return "exception"
+        if score.distractor_penalty >= 0.7:
+            return "context"
+        if score.core_issue_score >= 0.70 and score.distractor_penalty < 0.5:
+            return "direct_basis"
+        if score.target_object_score > 0 and score.core_issue_score < 0.25:
+            return "context"
+
         haystack = self._haystack(ranked, unit)
         contract_modification_query = self._is_contract_modification_query(plan)
         if contract_modification_query and self._is_contract_modification_direct_basis(haystack):

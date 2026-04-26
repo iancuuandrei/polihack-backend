@@ -81,6 +81,7 @@ class QueryOrchestrator:
             plan=query_plan,
             retrieval_response=raw_retrieval,
             graph_expansion=graph_expansion,
+            query_frame=query_frame,
             debug=request.debug,
         )
         compiled_evidence = self.evidence_pack_compiler.compile(
