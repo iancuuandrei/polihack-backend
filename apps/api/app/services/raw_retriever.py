@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -56,6 +57,10 @@ class RawRetrievalStore(Protocol):
 class PostgresRawRetrievalStore:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        self._unit_columns: set[str] | None = None
+
+    async def rollback_after_error(self) -> None:
+        await self.session.rollback()
 
     async def exact_citation_lookup(
         self,
@@ -66,38 +71,59 @@ class PostgresRawRetrievalStore:
     ) -> list[dict[str, Any]]:
         if not citations:
             return []
+        available_columns = await self._get_unit_columns()
+        select_columns = _unit_select_columns_sql(available_columns, alias="u")
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for citation in citations:
-            clauses, params = _sql_filters(filters, alias="u")
+            clauses, params = _sql_filters(
+                filters,
+                alias="u",
+                available_columns=available_columns,
+            )
             law_id = _text_value(citation.get("law_id"))
             article_number = _text_value(citation.get("article_number"))
             if not law_id or not article_number:
                 continue
-            clauses.extend(["u.law_id = :law_id", "u.article_number = :article_number"])
+            clauses.extend(
+                [
+                    _sql_text_equals(available_columns, "law_id", "law_id", alias="u"),
+                    _sql_text_equals(
+                        available_columns,
+                        "article_number",
+                        "article_number",
+                        alias="u",
+                    ),
+                ]
+            )
             params.update({"law_id": law_id, "article_number": article_number})
             for field_name in ("paragraph_number", "letter_number", "point_number"):
                 value = _text_value(citation.get(field_name))
                 if value:
-                    clauses.append(f"u.{field_name} = :{field_name}")
+                    clauses.append(
+                        _sql_text_equals(
+                            available_columns,
+                            field_name,
+                            field_name,
+                            alias="u",
+                        )
+                    )
                     params[field_name] = value
             params["limit"] = max(1, limit - len(rows))
-            result = await self.session.execute(
-                text(
-                    f"""
-                    SELECT {_UNIT_SELECT_COLUMNS}
-                    FROM legal_units u
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY
-                        CASE WHEN u.status = 'active' THEN 0
-                             WHEN u.status = 'unknown' THEN 1
-                             ELSE 2 END,
-                        u.id
-                    LIMIT :limit
-                    """
-                ),
-                params,
-            )
+            order_by = _unit_order_by_sql(available_columns, alias="u")
+            async with self.session.begin_nested():
+                result = await self.session.execute(
+                    text(
+                        f"""
+                        SELECT {select_columns}
+                        FROM legal_units u
+                        WHERE {' AND '.join(clauses)}
+                        ORDER BY {order_by}
+                        LIMIT :limit
+                        """
+                    ),
+                    params,
+                )
             for row in result.mappings().all():
                 unit = _unit_from_row(row)
                 if unit["id"] not in seen:
@@ -114,33 +140,46 @@ class PostgresRawRetrievalStore:
         filters: Mapping[str, Any],
         limit: int,
     ) -> list[dict[str, Any]]:
-        clauses, params = _sql_filters(filters, alias="u")
+        available_columns = await self._get_unit_columns()
+        clauses, params = _sql_filters(
+            filters,
+            alias="u",
+            available_columns=available_columns,
+        )
+        select_columns = _unit_select_columns_sql(available_columns, alias="u")
+        search_document = _unit_search_text_sql(available_columns, alias="u")
         params.update({"question": question, "limit": limit})
         try:
-            result = await self.session.execute(
-                text(
-                    f"""
-                    WITH q AS (
-                        SELECT websearch_to_tsquery('simple', :question) AS query
-                    )
-                    SELECT
-                        {_UNIT_SELECT_COLUMNS},
-                        ts_rank_cd(
-                            to_tsvector('simple', coalesce(u.raw_text, '') || ' ' || coalesce(u.normalized_text, '')),
-                            q.query
-                        ) AS bm25_score
-                    FROM legal_units u, q
-                    WHERE q.query @@ to_tsvector('simple', coalesce(u.raw_text, '') || ' ' || coalesce(u.normalized_text, ''))
-                      AND {' AND '.join(clauses)}
-                    ORDER BY bm25_score DESC, u.id
-                    LIMIT :limit
-                    """
-                ),
-                params,
-            )
+            async with self.session.begin_nested():
+                result = await self.session.execute(
+                    text(
+                        f"""
+                        WITH q AS (
+                            SELECT websearch_to_tsquery('simple', :question) AS query
+                        )
+                        SELECT
+                            {select_columns},
+                            ts_rank_cd(
+                                to_tsvector('simple', {search_document}),
+                                q.query
+                            ) AS bm25_score
+                        FROM legal_units u, q
+                        WHERE q.query @@ to_tsvector('simple', {search_document})
+                          AND {' AND '.join(clauses)}
+                        ORDER BY bm25_score DESC, u.id
+                        LIMIT :limit
+                        """
+                    ),
+                    params,
+                )
             return [_unit_from_row(row) for row in result.mappings().all()]
         except Exception:
-            return await self._lexical_ilike_fallback(question, filters=filters, limit=limit)
+            return await self._lexical_ilike_fallback(
+                question,
+                filters=filters,
+                limit=limit,
+                available_columns=available_columns,
+            )
 
     async def _lexical_ilike_fallback(
         self,
@@ -148,20 +187,28 @@ class PostgresRawRetrievalStore:
         *,
         filters: Mapping[str, Any],
         limit: int,
+        available_columns: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         terms = _query_terms(question)[:8]
         if not terms:
             return []
-        clauses, params = _sql_filters(filters, alias="u")
+        if available_columns is None:
+            available_columns = await self._get_unit_columns()
+        clauses, params = _sql_filters(
+            filters,
+            alias="u",
+            available_columns=available_columns,
+        )
+        select_columns = _unit_select_columns_sql(available_columns, alias="u")
+        search_document = _unit_search_text_sql(available_columns, alias="u")
+        if search_document == "''":
+            return []
         match_clauses: list[str] = []
         score_parts: list[str] = []
         for index, term in enumerate(terms):
             param_name = f"term_{index}"
             params[param_name] = f"%{term}%"
-            condition = (
-                f"(u.raw_text ILIKE :{param_name} OR "
-                f"coalesce(u.normalized_text, '') ILIKE :{param_name})"
-            )
+            condition = f"{search_document} ILIKE :{param_name}"
             match_clauses.append(condition)
             score_parts.append(f"CASE WHEN {condition} THEN 1.0 ELSE 0.0 END")
         params["limit"] = limit
@@ -169,7 +216,7 @@ class PostgresRawRetrievalStore:
             text(
                 f"""
                 SELECT
-                    {_UNIT_SELECT_COLUMNS},
+                    {select_columns},
                     (({' + '.join(score_parts)}) / {float(len(terms))}) AS bm25_score
                 FROM legal_units u
                 WHERE ({' OR '.join(match_clauses)})
@@ -189,29 +236,55 @@ class PostgresRawRetrievalStore:
         filters: Mapping[str, Any],
         limit: int,
     ) -> list[dict[str, Any]]:
-        clauses, params = _sql_filters(filters, alias="u")
+        available_columns = await self._get_unit_columns()
+        clauses, params = _sql_filters(
+            filters,
+            alias="u",
+            available_columns=available_columns,
+        )
+        select_columns = _unit_select_columns_sql(available_columns, alias="u")
         params.update(
             {
                 "embedding": _vector_literal(query_embedding),
                 "limit": limit,
             }
         )
-        result = await self.session.execute(
-            text(
-                f"""
-                SELECT
-                    {_UNIT_SELECT_COLUMNS},
-                    greatest(0.0, least(1.0, 1.0 - (e.embedding <=> :embedding::vector))) AS dense_score
-                FROM legal_embeddings e
-                JOIN legal_units u ON u.id = e.legal_unit_id
-                WHERE {' AND '.join(clauses)}
-                ORDER BY e.embedding <=> :embedding::vector, u.id
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
+        async with self.session.begin_nested():
+            result = await self.session.execute(
+                text(
+                    f"""
+                    SELECT
+                        {select_columns},
+                        greatest(0.0, least(1.0, 1.0 - (e.embedding <=> :embedding::vector))) AS dense_score
+                    FROM legal_embeddings e
+                    JOIN legal_units u ON u.id = e.legal_unit_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY e.embedding <=> :embedding::vector, u.id
+                    LIMIT :limit
+                    """
+                ),
+                params,
+            )
         return [_unit_from_row(row) for row in result.mappings().all()]
+
+    async def _get_unit_columns(self) -> set[str]:
+        if self._unit_columns is None:
+            async with self.session.begin_nested():
+                result = await self.session.execute(
+                    text(
+                        """
+                        SELECT a.attname AS column_name
+                        FROM pg_attribute a
+                        WHERE a.attrelid = 'legal_units'::regclass
+                          AND a.attnum > 0
+                          AND NOT a.attisdropped
+                        """
+                    )
+                )
+            self._unit_columns = {
+                str(row["column_name"]) for row in result.mappings().all()
+            }
+        return self._unit_columns
 
 
 class EmptyRawRetrievalStore:
@@ -281,6 +354,7 @@ class RawRetriever:
             ),
             warnings=warnings,
             warning_code="exact_citation_lookup_failed",
+            debug=request.debug,
         )
         rankings[EXACT_METHOD] = [row["id"] for row in exact_rows]
         for row in exact_rows:
@@ -295,6 +369,7 @@ class RawRetriever:
             self.store.lexical_search(request.question, filters=filters, limit=method_limit),
             warnings=warnings,
             warning_code="fts_retrieval_failed",
+            debug=request.debug,
         )
         max_bm25 = max([_float(row.get("bm25_score")) for row in fts_rows] or [0.0])
         rankings[FTS_METHOD] = [row["id"] for row in fts_rows]
@@ -317,6 +392,7 @@ class RawRetriever:
                 ),
                 warnings=warnings,
                 warning_code="dense_retrieval_failed_or_unavailable",
+                debug=request.debug,
             )
         else:
             warnings.append("dense_retrieval_skipped_no_query_embedding")
@@ -389,11 +465,18 @@ class RawRetriever:
         *,
         warnings: list[str],
         warning_code: str,
+        debug: bool,
     ) -> list[dict[str, Any]]:
         try:
             return await store_call
-        except Exception:
-            warnings.append(warning_code)
+        except Exception as exc:
+            warnings.append(_debug_warning(warning_code, exc) if debug else warning_code)
+            rollback = getattr(self.store, "rollback_after_error", None)
+            if rollback is not None:
+                try:
+                    await rollback()
+                except Exception:
+                    pass
             return []
 
     def _to_candidate(
@@ -463,6 +546,21 @@ def _citation_filters(request: RawRetrievalRequest) -> list[dict[str, Any]]:
     return deduped
 
 
+def _debug_warning(warning_code: str, exc: Exception) -> str:
+    return f"{warning_code}:{type(exc).__name__}:{_sanitize_exception_message(exc)}"
+
+
+def _sanitize_exception_message(exc: Exception) -> str:
+    message = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+    if not message:
+        message = repr(exc)
+    for pattern, replacement in _WARNING_REDACTIONS:
+        message = pattern.sub(replacement, message)
+    if len(message) > _MAX_WARNING_MESSAGE_LENGTH:
+        message = message[: _MAX_WARNING_MESSAGE_LENGTH - 3].rstrip() + "..."
+    return message
+
+
 def _canonical_citation_filter(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "law_id": _text_value(payload.get("law_id") or payload.get("law_id_hint")),
@@ -473,25 +571,87 @@ def _canonical_citation_filter(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sql_filters(filters: Mapping[str, Any], *, alias: str) -> tuple[list[str], dict[str, Any]]:
+def _sql_filters(
+    filters: Mapping[str, Any],
+    *,
+    alias: str,
+    available_columns: set[str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
     clauses = ["1 = 1"]
     params: dict[str, Any] = {}
     legal_domain = _text_value(filters.get("legal_domain"))
     if legal_domain:
-        clauses.append(f"lower({alias}.legal_domain) = lower(:legal_domain)")
-        params["legal_domain"] = legal_domain
+        if _has_column(available_columns, "legal_domain"):
+            clauses.append(f"lower({alias}.legal_domain::text) = lower(:legal_domain)")
+            params["legal_domain"] = legal_domain
+        else:
+            clauses.append("1 = 0")
     status = _text_value(filters.get("status"))
     if status:
-        if status == "active":
-            clauses.append(f"{alias}.status IN ('active', 'unknown')")
-        else:
-            clauses.append(f"{alias}.status = :status")
+        if _has_column(available_columns, "status"):
+            clauses.append(f"{alias}.status::text = :status")
             params["status"] = status
+        else:
+            clauses.append("1 = 0")
     law_id = _text_value(filters.get("law_id"))
     if law_id:
-        clauses.append(f"{alias}.law_id = :filter_law_id")
-        params["filter_law_id"] = law_id
+        if _has_column(available_columns, "law_id"):
+            clauses.append(f"{alias}.law_id::text = :filter_law_id")
+            params["filter_law_id"] = law_id
+        else:
+            clauses.append("1 = 0")
     return clauses, params
+
+
+def _has_column(available_columns: set[str] | None, column: str) -> bool:
+    return available_columns is None or column in available_columns
+
+
+def _sql_text_equals(
+    available_columns: set[str],
+    column: str,
+    param_name: str,
+    *,
+    alias: str,
+) -> str:
+    if column not in available_columns:
+        return "1 = 0"
+    return f"{alias}.{column}::text = :{param_name}"
+
+
+def _unit_select_columns_sql(available_columns: set[str], *, alias: str) -> str:
+    select_parts = []
+    for column in _UNIT_COLUMNS:
+        if column in available_columns:
+            select_parts.append(f"{alias}.{column} AS {column}")
+        else:
+            select_parts.append(f"NULL AS {column}")
+    return ", ".join(select_parts)
+
+
+def _unit_search_text_sql(available_columns: set[str], *, alias: str) -> str:
+    text_parts = [
+        f"coalesce({alias}.{column}::text, '')"
+        for column in ("raw_text", "normalized_text")
+        if column in available_columns
+    ]
+    if not text_parts:
+        return "''"
+    return " || ' ' || ".join(text_parts)
+
+
+def _unit_order_by_sql(available_columns: set[str], *, alias: str) -> str:
+    order_parts = []
+    if "status" in available_columns:
+        order_parts.append(
+            f"""
+            CASE WHEN {alias}.status::text = 'active' THEN 0
+                 WHEN {alias}.status::text = 'unknown' THEN 1
+                 ELSE 2 END
+            """
+        )
+    order_parts.append(f"{alias}.id")
+    return ", ".join(order_parts)
 
 
 def _unit_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -627,7 +787,33 @@ _UNIT_COLUMNS = (
     "created_at",
     "updated_at",
 )
-_UNIT_SELECT_COLUMNS = ", ".join(f"u.{column}" for column in _UNIT_COLUMNS)
+_MAX_WARNING_MESSAGE_LENGTH = 240
+_WARNING_REDACTIONS = (
+    (
+        re.compile(r"(?i)\b(postgres(?:ql)?(?:\+asyncpg)?://)([^:@/\s]+):([^@/\s]+)@"),
+        r"\1\2:***@",
+    ),
+    (re.compile(r"(?i)(\bpassword=)([^&\s;]+)"), r"\1***"),
+    (re.compile(r"(?i)\bDATABASE_URL=\S+"), "<redacted_database_url>"),
+    (
+        re.compile(
+            r"(?is)((?:['\"])?(?:raw_text|normalized_text|embedding_text)(?:['\"])?\s*[:=]\s*)(['\"])(.*?)(\2)"
+        ),
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>{match.group(4)}",
+    ),
+    (re.compile(r"(?i)\b(raw_text|normalized_text|embedding_text)\b"), "<text_field>"),
+    (
+        re.compile(r"(?is)((?:['\"])?embedding(?:['\"])?\s*[:=]\s*)\[[^\]]*\]"),
+        r"\1[<redacted>]",
+    ),
+    (
+        re.compile(
+            r"\[(?:\s*-?\d+(?:\.\d+)?(?:e[+-]?\d+)?\s*,){2,}\s*-?\d+(?:\.\d+)?(?:e[+-]?\d+)?\s*\]",
+            re.IGNORECASE,
+        ),
+        "[<redacted_vector>]",
+    ),
+)
 _STOP_WORDS = {
     "care",
     "este",

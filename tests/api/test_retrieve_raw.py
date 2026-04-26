@@ -31,8 +31,9 @@ def test_endpoint_schema_valid_with_dependency_override():
     payload = response.json()
     assert response.status_code == 200
     assert payload["candidates"]
-    assert payload["candidates"][0]["unit_id"] == "ro.codul_muncii.art_41"
-    assert payload["candidates"][0]["unit"]["raw_text"]
+    by_id = {candidate["unit_id"]: candidate for candidate in payload["candidates"]}
+    assert "ro.codul_muncii.art_41" in by_id
+    assert by_id["ro.codul_muncii.art_41"]["unit"]["raw_text"]
     assert payload["debug"]["candidate_count"] >= 1
     assert "query_embedding" not in payload
 
@@ -70,11 +71,43 @@ async def test_exact_citation_art_41_returns_matching_unit():
     )
 
     assert response.candidates
-    candidate = response.candidates[0]
+    candidate = next(
+        candidate
+        for candidate in response.candidates
+        if candidate.unit_id == "ro.codul_muncii.art_41"
+    )
     assert candidate.unit_id == "ro.codul_muncii.art_41"
     assert candidate.unit["article_number"] == "41"
     assert candidate.score_breakdown["exact_citation_boost"] == 1.0
     assert "exact citation" in candidate.why_retrieved
+
+
+@pytest.mark.anyio
+async def test_exact_citation_art_41_returns_descendant_units_from_fixture_db():
+    response = await RawRetriever(FakeStore()).retrieve(
+        _request(
+            exact_citations=[{"law_id": "ro.codul_muncii", "article_number": "41"}],
+            top_k=10,
+            debug=True,
+        )
+    )
+
+    candidate_ids = {candidate.unit_id for candidate in response.candidates}
+    assert {
+        "ro.codul_muncii.art_41",
+        "ro.codul_muncii.art_41.alin_1",
+        "ro.codul_muncii.art_41.alin_2",
+        "ro.codul_muncii.art_41.alin_3.lit_e",
+    }.issubset(candidate_ids)
+    assert all(
+        candidate.unit["article_number"] == "41"
+        for candidate in response.candidates
+        if candidate.unit_id.startswith("ro.codul_muncii.art_41")
+    )
+    assert not any(
+        warning.startswith("exact_citation_lookup_failed")
+        for warning in response.warnings
+    )
 
 
 @pytest.mark.anyio
@@ -148,6 +181,7 @@ async def test_score_breakdown_has_required_fields_and_top_k_is_respected():
         "domain_match",
         "metadata_validity",
         "exact_citation_boost",
+        "rrf",
     }.issubset(breakdown)
 
 
@@ -160,6 +194,33 @@ async def test_response_does_not_include_vectors():
     payload = response.model_dump(mode="json")
     assert "embedding" not in str(payload)
     assert "0.1, 0.2, 0.3" not in str(payload)
+
+
+@pytest.mark.anyio
+async def test_debug_store_warning_includes_sanitized_exception_details():
+    response = await RawRetriever(FailingExactStore()).retrieve(_request(debug=True))
+
+    warning = next(
+        warning
+        for warning in response.warnings
+        if warning.startswith("exact_citation_lookup_failed:")
+    )
+    assert warning.startswith("exact_citation_lookup_failed:RuntimeError:")
+    assert "super-secret" not in warning
+    assert "DATABASE_URL" not in warning
+    assert "raw_text" not in warning
+    assert "[0.1, 0.2, 0.3]" not in warning
+
+
+@pytest.mark.anyio
+async def test_non_debug_store_warning_keeps_generic_code():
+    response = await RawRetriever(FailingExactStore()).retrieve(_request(debug=False))
+
+    assert "exact_citation_lookup_failed" in response.warnings
+    assert not any(
+        warning.startswith("exact_citation_lookup_failed:")
+        for warning in response.warnings
+    )
 
 
 def _request(**overrides):
@@ -209,12 +270,20 @@ class FakeStore:
         ][:limit]
 
 
+class FailingExactStore(FakeStore):
+    async def exact_citation_lookup(self, citations, *, filters, limit):
+        raise RuntimeError(
+            "DATABASE_URL=postgresql://lexai:super-secret@localhost/lexai "
+            "raw_text='SECRET_RAW_TEXT' embedding=[0.1, 0.2, 0.3]"
+        )
+
+
 def _filtered_units(filters):
     rows = []
     for unit in _UNITS:
         if filters.get("legal_domain") and unit["legal_domain"] != filters["legal_domain"]:
             continue
-        if filters.get("status") == "active" and unit["status"] not in {"active", "unknown"}:
+        if filters.get("status") and unit["status"] != filters["status"]:
             continue
         rows.append(unit)
     return rows
@@ -273,6 +342,118 @@ _UNITS = [
         "legal_concepts": ["salariu"],
         "source_url": "https://legislatie.just.ro/test",
         "parent_id": None,
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    },
+    {
+        "id": "ro.codul_muncii.art_41.alin_1",
+        "canonical_id": "ro.codul_muncii.art_41.alin_1",
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (1)"],
+        "article_number": "41",
+        "paragraph_number": "1",
+        "letter_number": None,
+        "point_number": None,
+        "raw_text": "(1) Contractul individual de munca poate fi modificat numai prin acordul partilor.",
+        "normalized_text": "contract individual munca modificat acord parti act aditional salariu",
+        "legal_domain": "munca",
+        "legal_concepts": ["contract", "salariu"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parent_id": "ro.codul_muncii.art_41",
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    },
+    {
+        "id": "ro.codul_muncii.art_41.alin_2",
+        "canonical_id": "ro.codul_muncii.art_41.alin_2",
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (2)"],
+        "article_number": "41",
+        "paragraph_number": "2",
+        "letter_number": None,
+        "point_number": None,
+        "raw_text": "(2) Modificarea contractului individual de munca se refera la elementele contractuale.",
+        "normalized_text": "modificare contract individual munca elemente contractuale",
+        "legal_domain": "munca",
+        "legal_concepts": ["contract"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parent_id": "ro.codul_muncii.art_41",
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    },
+    {
+        "id": "ro.codul_muncii.art_41.alin_3",
+        "canonical_id": "ro.codul_muncii.art_41.alin_3",
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (3)"],
+        "article_number": "41",
+        "paragraph_number": "3",
+        "letter_number": None,
+        "point_number": None,
+        "raw_text": "(3) Modificarea contractului individual de munca poate privi durata, locul, felul muncii si salariul.",
+        "normalized_text": "modificare contract individual munca durata loc fel salariu",
+        "legal_domain": "munca",
+        "legal_concepts": ["contract", "salariu"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parent_id": "ro.codul_muncii.art_41",
+        "parser_warnings": [],
+        "created_at": None,
+        "updated_at": None,
+    },
+    {
+        "id": "ro.codul_muncii.art_41.alin_3.lit_e",
+        "canonical_id": "ro.codul_muncii.art_41.alin_3.lit_e",
+        "source_id": "fixture",
+        "law_id": "ro.codul_muncii",
+        "law_title": "Codul muncii",
+        "act_type": "code",
+        "act_number": None,
+        "publication_date": None,
+        "effective_date": None,
+        "version_start": None,
+        "version_end": None,
+        "status": "active",
+        "hierarchy_path": ["Codul muncii", "Art. 41", "Alin. (3)", "Lit. e)"],
+        "article_number": "41",
+        "paragraph_number": "3",
+        "letter_number": "e",
+        "point_number": None,
+        "raw_text": "e) salariul;",
+        "normalized_text": "salariu",
+        "legal_domain": "munca",
+        "legal_concepts": ["salariu"],
+        "source_url": "https://legislatie.just.ro/test",
+        "parent_id": "ro.codul_muncii.art_41.alin_3",
         "parser_warnings": [],
         "created_at": None,
         "updated_at": None,
